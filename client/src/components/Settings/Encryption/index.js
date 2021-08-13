@@ -29,9 +29,13 @@ class Encryption extends Component {
     }, DEBOUNCE_TIMEOUT);
 
     getInitialValues = (data) => {
-        const { certificate_chain, private_key } = data;
-        const certificate_source = certificate_chain ? 'content' : 'path';
-        const key_source = private_key ? 'content' : 'path';
+        const { certificate_chain, private_key, use_saved_key } = data;
+        const certificate_source = certificate_chain
+            ? ENCRYPTION_SOURCE.CONTENT
+            : ENCRYPTION_SOURCE.PATH;
+        const key_source = private_key || use_saved_key
+            ? ENCRYPTION_SOURCE.CONTENT
+            : ENCRYPTION_SOURCE.PATH;
 
         return {
             ...data,
@@ -71,6 +75,7 @@ class Encryption extends Component {
             private_key,
             certificate_path,
             private_key_path,
+            use_saved_key
         } = encryption;
 
         const initialValues = this.getInitialValues({
@@ -84,6 +89,7 @@ class Encryption extends Component {
             private_key,
             certificate_path,
             private_key_path,
+            use_saved_key
         });
 
         return (

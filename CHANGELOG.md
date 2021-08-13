@@ -15,6 +15,7 @@ and this project adheres to
 
 ### Added
 
+- Added use saved option when setting private key as string ([#1898])
 - Static IP address detection on FreeBSD ([#3289]).
 - Optimistic cache ([#2145]).
 - New possible value of `6h` for `querylog_interval` setting ([#2504]).
@@ -65,6 +66,7 @@ and this project adheres to
 
 ### Fixed
 
+- If private key was saved as a string, then hide it from the UI ([#1898])
 - Client ID checking ([#3437]).
 - Discovering other DHCP servers on `darwin` and `freebsd` ([#3417]).
 - Switching listening address to unspecified one when bound to a single
@@ -92,6 +94,7 @@ and this project adheres to
 
 [#1381]: https://github.com/AdguardTeam/AdGuardHome/issues/1381
 [#1691]: https://github.com/AdguardTeam/AdGuardHome/issues/1691
+[#1898]: https://github.com/AdguardTeam/AdGuardHome/issues/1898
 [#2141]: https://github.com/AdguardTeam/AdGuardHome/issues/2141
 [#2145]: https://github.com/AdguardTeam/AdGuardHome/issues/2145
 [#2280]: https://github.com/AdguardTeam/AdGuardHome/issues/2280

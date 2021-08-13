@@ -210,15 +210,23 @@ type tlsConfigStatus struct {
 
 // field ordering is important -- yaml fields will mirror ordering from here
 type tlsConfig struct {
-	tlsConfigStatus   `json:",inline"`
+	tlsConfigStatus          `json:",inline"`
+	tlsConfigSettingsWithKey `json:",inline"`
+}
+
+type tlsConfigSettingsWithKey struct {
 	tlsConfigSettings `json:",inline"`
+	// If private key saved as string, we set this flag to true and omit it from answer.
+	UseSavedKey bool `json:"use_saved_key,inline"`
 }
 
 func (t *TLSMod) handleTLSStatus(w http.ResponseWriter, _ *http.Request) {
 	t.confLock.Lock()
 	data := tlsConfig{
-		tlsConfigSettings: t.conf,
-		tlsConfigStatus:   t.status,
+		tlsConfigSettingsWithKey: tlsConfigSettingsWithKey{
+			tlsConfigSettings: t.conf,
+		},
+		tlsConfigStatus: t.status,
 	}
 	t.confLock.Unlock()
 	marshalTLS(w, data)
@@ -231,19 +239,23 @@ func (t *TLSMod) handleTLSValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if setts.UseSavedKey {
+		setts.PrivateKey = t.conf.PrivateKey
+	}
+
 	if !WebCheckPortAvailable(setts.PortHTTPS) {
 		httpError(w, http.StatusBadRequest, "port %d is not available, cannot enable HTTPS on it", setts.PortHTTPS)
 		return
 	}
 
 	status := tlsConfigStatus{}
-	if tlsLoadConfig(&setts, &status) {
+	if tlsLoadConfig(&setts.tlsConfigSettings, &status) {
 		status = validateCertificates(string(setts.CertificateChainData), string(setts.PrivateKeyData), setts.ServerName)
 	}
 
 	data := tlsConfig{
-		tlsConfigSettings: setts,
-		tlsConfigStatus:   status,
+		tlsConfigSettingsWithKey: setts,
+		tlsConfigStatus:          status,
 	}
 	marshalTLS(w, data)
 }
@@ -290,16 +302,20 @@ func (t *TLSMod) handleTLSConfigure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if data.UseSavedKey {
+		data.PrivateKey = t.conf.PrivateKey
+	}
+
 	if !WebCheckPortAvailable(data.PortHTTPS) {
 		httpError(w, http.StatusBadRequest, "port %d is not available, cannot enable HTTPS on it", data.PortHTTPS)
 		return
 	}
 
 	status := tlsConfigStatus{}
-	if !tlsLoadConfig(&data, &status) {
+	if !tlsLoadConfig(&data.tlsConfigSettings, &status) {
 		data2 := tlsConfig{
-			tlsConfigSettings: data,
-			tlsConfigStatus:   t.status,
+			tlsConfigSettingsWithKey: data,
+			tlsConfigStatus:          t.status,
 		}
 		marshalTLS(w, data2)
 
@@ -308,7 +324,7 @@ func (t *TLSMod) handleTLSConfigure(w http.ResponseWriter, r *http.Request) {
 
 	status = validateCertificates(string(data.CertificateChainData), string(data.PrivateKeyData), data.ServerName)
 
-	restartHTTPS := t.setConfig(data, status)
+	restartHTTPS := t.setConfig(data.tlsConfigSettings, status)
 	t.setCertFileTime()
 	onConfigModified()
 
@@ -320,8 +336,8 @@ func (t *TLSMod) handleTLSConfigure(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data2 := tlsConfig{
-		tlsConfigSettings: data,
-		tlsConfigStatus:   t.status,
+		tlsConfigSettingsWithKey: data,
+		tlsConfigStatus:          t.status,
 	}
 
 	marshalTLS(w, data2)
@@ -335,7 +351,7 @@ func (t *TLSMod) handleTLSConfigure(w http.ResponseWriter, r *http.Request) {
 	// goroutine due to the same reason.
 	if restartHTTPS {
 		go func() {
-			Context.web.TLSConfigChanged(context.Background(), data)
+			Context.web.TLSConfigChanged(context.Background(), data.tlsConfigSettings)
 		}()
 	}
 }
@@ -514,8 +530,8 @@ func parsePrivateKey(der []byte) (crypto.PrivateKey, string, error) {
 }
 
 // unmarshalTLS handles base64-encoded certificates transparently
-func unmarshalTLS(r *http.Request) (tlsConfigSettings, error) {
-	data := tlsConfigSettings{}
+func unmarshalTLS(r *http.Request) (tlsConfigSettingsWithKey, error) {
+	data := tlsConfigSettingsWithKey{}
 	err := json.NewDecoder(r.Body).Decode(&data)
 	if err != nil {
 		return data, fmt.Errorf("failed to parse new TLS config json: %w", err)
@@ -559,8 +575,8 @@ func marshalTLS(w http.ResponseWriter, data tlsConfig) {
 	}
 
 	if data.PrivateKey != "" {
-		encoded := base64.StdEncoding.EncodeToString([]byte(data.PrivateKey))
-		data.PrivateKey = encoded
+		data.UseSavedKey = true
+		data.PrivateKey = ""
 	}
 
 	err := json.NewEncoder(w).Encode(data)
