@@ -9,12 +9,14 @@ class StatsConfig extends Component {
     handleFormSubmit = (values) => {
         const { t, interval: prevInterval } = this.props;
 
+        const config = { interval: values.interval || 0 };
+
         if (values.interval < prevInterval) {
             if (window.confirm(t('statistics_retention_confirm'))) {
-                this.props.setStatsConfig(values);
+                this.props.setStatsConfig(config);
             }
         } else {
-            this.props.setStatsConfig(values);
+            this.props.setStatsConfig(config);
         }
     };
 

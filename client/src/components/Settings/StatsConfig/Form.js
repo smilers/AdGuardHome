@@ -4,14 +4,12 @@ import { Field, reduxForm } from 'redux-form';
 import { Trans, withTranslation } from 'react-i18next';
 import flow from 'lodash/flow';
 
-import { renderRadioField, toNumber } from '../../../helpers/form';
+import { renderRadioField, toNumber, CheckboxField } from '../../../helpers/form';
 import { FORM_NAME, STATS_INTERVALS_DAYS } from '../../../helpers/constants';
 import '../FormButton.css';
 
 const getIntervalTitle = (interval, t) => {
     switch (interval) {
-        case 0:
-            return t('disabled');
         case 1:
             return t('interval_24_hour');
         default:
@@ -32,11 +30,26 @@ const getIntervalFields = (processing, t, toNumber) => STATS_INTERVALS_DAYS.map(
 
 const Form = (props) => {
     const {
-        handleSubmit, processing, submitting, invalid, handleReset, processingReset, t,
+        handleSubmit,
+        processing,
+        submitting,
+        invalid,
+        handleReset,
+        processingReset,
+        t,
     } = props;
 
     return (
         <form onSubmit={handleSubmit}>
+            <div className="form__group form__group--settings">
+                <Field
+                    name="interval"
+                    type="checkbox"
+                    component={CheckboxField}
+                    placeholder={t('statistics_enable')}
+                    disabled={processing}
+                />
+            </div>
             <label className="form__label form__label--with-desc">
                 <Trans>statistics_retention</Trans>
             </label>
