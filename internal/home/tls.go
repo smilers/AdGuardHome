@@ -221,8 +221,8 @@ type tlsConfig struct {
 func (t *TLSMod) handleTLSStatus(w http.ResponseWriter, _ *http.Request) {
 	t.confLock.Lock()
 	data := tlsConfig{
-		tlsConfigStatus:   t.status,
 		tlsConfigSettings: t.conf,
+		tlsConfigStatus:   t.status,
 	}
 	t.confLock.Unlock()
 	hidePrivateKey := data.PrivateKey != ""
