@@ -10,43 +10,52 @@ import (
 	"github.com/kardianos/service"
 )
 
-func newSysLogger(name string, errs chan<- error) (service.Logger, error) {
-	return sysLogger(errs), nil
+// newSysLogger returns a stub service.Logger implementation.
+func newSysLogger(_ string, _ chan<- error) (service.Logger, error) {
+	return sysLogger{}, nil
 }
 
-type sysLogger chan<- error
+// sysLogger wraps calls of the logging functions understandable for service
+// interfaces.
+type sysLogger struct{}
 
-func (s sysLogger) Error(v ...interface{}) error {
+// Error implements service.Logger interface for sysLogger.
+func (sysLogger) Error(v ...interface{}) error {
 	log.Error(fmt.Sprint(v...))
 
 	return nil
 }
 
-func (s sysLogger) Warning(v ...interface{}) error {
+// Warning implements service.Logger interface for sysLogger.
+func (sysLogger) Warning(v ...interface{}) error {
 	log.Info("warning: %s", fmt.Sprint(v...))
 
 	return nil
 }
 
-func (s sysLogger) Info(v ...interface{}) error {
+// Info implements service.Logger interface for sysLogger.
+func (sysLogger) Info(v ...interface{}) error {
 	log.Info(fmt.Sprint(v...))
 
 	return nil
 }
 
-func (s sysLogger) Errorf(format string, a ...interface{}) error {
+// Errorf implements service.Logger interface for sysLogger.
+func (sysLogger) Errorf(format string, a ...interface{}) error {
 	log.Error(format, a...)
 
 	return nil
 }
 
-func (s sysLogger) Warningf(format string, a ...interface{}) error {
+// Warningf implements service.Logger interface for sysLogger.
+func (sysLogger) Warningf(format string, a ...interface{}) error {
 	log.Info("warning: %s", fmt.Sprintf(format, a...))
 
 	return nil
 }
 
-func (s sysLogger) Infof(format string, a ...interface{}) error {
+// Infof implements service.Logger interface for sysLogger.
+func (sysLogger) Infof(format string, a ...interface{}) error {
 	log.Info(format, a...)
 
 	return nil

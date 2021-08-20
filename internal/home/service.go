@@ -28,7 +28,8 @@ const (
 	serviceDescription = "AdGuard Home: Network-level blocker"
 )
 
-// Represents the program that will be launched by a service or daemon.
+// program represents the program that will be launched by as a service or a
+// daemon.
 type program struct {
 	clientBuildFS fs.FS
 	opts          options

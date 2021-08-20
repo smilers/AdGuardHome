@@ -4,6 +4,7 @@
 package home
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"os/signal"
@@ -21,27 +22,19 @@ import (
 // OpenBSD Service Implementation
 //
 // The file contains OpenBSD implementations for service.System and
-// service.Service.  It uses the default approach for RunCom-based service
-// systems, e.g. rc.d script.
+// service.Service interfaces.  It uses the default approach for RunCom-based
+// services systems, e.g. rc.d script.  It's written as if it was in a separate
+// package and has only one internal dependency.
 //
 // TODO(e.burkov):  Perhaps, file a PR to github.com/kardianos/service.
 
-const (
-	// sysVersion is the version of local service.System interface
-	// implementation.
-	sysVersion = "openbsd-runcom"
-
-	// errNoUserServiceRunCom is returned when the service uses some custom
-	// path to script.
-	errNoUserServiceRunCom errors.Error = "user services are not supported on " + sysVersion
-)
+// sysVersion is the version of local service.System interface
+// implementation.
+const sysVersion = "openbsd-runcom"
 
 func chooseSystem() {
 	service.ChooseSystem(openbsdSystem{})
 }
-
-// type check
-var _ service.System = openbsdSystem{}
 
 // openbsdSystem is the service.System to be used on the OpenBSD.
 type openbsdSystem struct{}
@@ -127,8 +120,13 @@ func getFuncSingle(kv service.KeyValue, name string, defaultValue func()) (val f
 const (
 	// optionUserService is the UserService option name.
 	optionUserService = "UserService"
+
 	// optionUserServiceDefault is the UserService option default value.
 	optionUserServiceDefault = false
+
+	// errNoUserServiceRunCom is returned when the service uses some custom
+	// path to script.
+	errNoUserServiceRunCom errors.Error = "user services are not supported on " + sysVersion
 )
 
 // scriptPath returns the absolute path to the script.  It's commonly used to
@@ -146,6 +144,7 @@ func (s *openbsdRunComService) scriptPath() (cp string, err error) {
 const (
 	// optionRunComScript is the RunCom script option name.
 	optionRunComScript = "RunComScript"
+
 	// runComScript is the default RunCom script.
 	runComScript = `#!/bin/sh
 #
@@ -190,10 +189,104 @@ func (s *openbsdRunComService) execPath() (path string, err error) {
 	return filepath.Abs(path)
 }
 
+// annotate wraps errors.Annotate applying a common error format.
+func (s *openbsdRunComService) annotate(action string, err error) (annotated error) {
+	return errors.Annotate(err, "%s %s %s service: %w", action, sysVersion, s.Name)
+}
+
 // Install implements service.Service interface for *openbsdRunComService.
 func (s *openbsdRunComService) Install() (err error) {
-	defer func() { errors.Annotate(err, "installing %s %s service: %w", sysVersion, s.Name) }()
+	defer func() { err = s.annotate("installing", err) }()
 
+	if err = s.writeScript(); err != nil {
+		return err
+	}
+
+	return s.configureSysStartup()
+}
+
+// configureSysStartup adds s into the group of packages started with system.
+func (s *openbsdRunComService) configureSysStartup() (err error) {
+	const filename = `/etc/rc.conf.local`
+
+	var file *os.File
+	// Open or create a file.
+	file, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.WithDeferred(err, file.Close()) }()
+
+	var info os.FileInfo
+	info, err = file.Stat()
+	if err != nil {
+		return err
+	} else if info.IsDir() {
+		return fmt.Errorf("expected %s to be a file but it's a directory", info.Name())
+	}
+
+	return s.modifyRCConfLocal(file)
+}
+
+// modifyRCConfLocal checks the rc.conf.local and modifies it if needed.
+func (s *openbsdRunComService) modifyRCConfLocal(file *os.File) (err error) {
+	const pref = "pkg_scripts="
+
+	var prefIdx int
+	var ln string
+	scn := bufio.NewScanner(file)
+	for prefIdx = -2; scn.Scan(); {
+		ln = strings.TrimSpace(scn.Text())
+		if ln == "" {
+			continue
+		}
+
+		if prefIdx = strings.Index(ln, pref); prefIdx == 0 {
+			break
+		}
+	}
+
+	if err = scn.Err(); err != nil {
+		return err
+	}
+
+	b := &strings.Builder{}
+	switch prefIdx {
+	case -2:
+		// The file is empty.
+		stringutil.WriteToBuilder(b, pref)
+	case 0:
+		// Current line contains the desired prefix.
+		svcs := strings.Split(ln[len(pref):], " ")
+		if stringutil.InSlice(svcs, s.Name) {
+			return
+		}
+
+		if len(svcs) > 0 && svcs[0] != "" {
+			stringutil.WriteToBuilder(b, " ")
+		}
+
+		// Rewrite new line rune.
+		//
+		// TODO(e.burkov):  It rewrites the last rune of the existing
+		// line if the file doesn't end with new line rune.  Though,
+		// such files are considered to be invalid, it also should be
+		// handled properly.
+		if _, err = file.Seek(-1, 1); err != nil {
+			return err
+		}
+	default:
+		// The file doesn't contain the desired prefix.
+		stringutil.WriteToBuilder(b, "\n", pref)
+	}
+	stringutil.WriteToBuilder(b, s.Name, "\n")
+
+	_, err = file.WriteString(b.String())
+	return err
+}
+
+// writeScript tries to write the script for the service.
+func (s *openbsdRunComService) writeScript() (err error) {
 	var scriptPath string
 	if scriptPath, err = s.scriptPath(); err != nil {
 		return err
@@ -236,7 +329,7 @@ func (s *openbsdRunComService) Install() (err error) {
 
 // Uninstall implements service.Service interface for *openbsdRunComService.
 func (s *openbsdRunComService) Uninstall() (err error) {
-	defer func() { errors.Annotate(err, "uninstalling %s %s service: %w", sysVersion, s.Name) }()
+	defer func() { err = s.annotate("uninstalling", err) }()
 
 	var scriptPath string
 	if scriptPath, err = s.scriptPath(); err != nil {
@@ -260,7 +353,16 @@ func (s *openbsdRunComService) SystemLogger(errs chan<- error) (l service.Logger
 	return newSysLogger(s.Name, errs)
 }
 
+// optionRunWait is the name of the option associated with function which waits
+// for the service to be stopped.
 const optionRunWait = "RunWait"
+
+// runWait is the default function to wait for service to be stopped.
+func runWait() {
+	sigChan := make(chan os.Signal, 3)
+	signal.Notify(sigChan, syscall.SIGTERM, os.Interrupt)
+	<-sigChan
+}
 
 // Run implements service.Service interface for *openbsdRunComService.
 func (s *openbsdRunComService) Run() (err error) {
@@ -268,15 +370,12 @@ func (s *openbsdRunComService) Run() (err error) {
 		return err
 	}
 
-	getFuncSingle(s.Option, optionRunWait, func() {
-		sigChan := make(chan os.Signal, 3)
-		signal.Notify(sigChan, syscall.SIGTERM, os.Interrupt)
-		<-sigChan
-	})()
+	getFuncSingle(s.Option, optionRunWait, runWait)()
 
 	return s.i.Stop(s)
 }
 
+// runCom calls the script with the specified cmd.
 func (s *openbsdRunComService) runCom(cmd string) (out string, err error) {
 	var scriptPath string
 	if scriptPath, err = s.scriptPath(); err != nil {
@@ -290,7 +389,7 @@ func (s *openbsdRunComService) runCom(cmd string) (out string, err error) {
 
 // Status implements service.Service interface for *openbsdRunComService.
 func (s *openbsdRunComService) Status() (status service.Status, err error) {
-	defer func() { errors.Annotate(err, "getting %s %s service status: %w", sysVersion, s.Name) }()
+	defer func() { err = s.annotate("getting status of", err) }()
 
 	var out string
 	if out, err = s.runCom("check"); err != nil {
@@ -311,14 +410,14 @@ func (s *openbsdRunComService) Status() (status service.Status, err error) {
 func (s *openbsdRunComService) Start() (err error) {
 	_, err = s.runCom("start")
 
-	return errors.Annotate(err, "starting %s %s service: %w", sysVersion, s.Name)
+	return s.annotate("starting", err)
 }
 
 // Stop implements service.Service interface for *openbsdRunComService.
 func (s *openbsdRunComService) Stop() (err error) {
 	_, err = s.runCom("stop")
 
-	return errors.Annotate(err, "stopping %s %s service: %w", sysVersion, s.Name)
+	return s.annotate("stopping", err)
 }
 
 // Restart implements service.Service interface for *openbsdRunComService.
