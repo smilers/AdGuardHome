@@ -4,6 +4,13 @@
 
 ## v0.107: API changes
 
+### New possible value of `"private_key"` field in `TlsConfig`
+
+* The value of `"private_key"` field in `POST /control/tls/configure`,
+`POST /control/tls/validate` and `GET /control/tls/status` methods
+could now take the value of `use_saved` if the private key was previosly
+saved as string.
+
 ### The new field `"cache_optimistic"` in DNS configuration
 
 * The new optional field `"cache_optimistic"` in `POST /control/dns_config`

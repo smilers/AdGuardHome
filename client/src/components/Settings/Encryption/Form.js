@@ -18,7 +18,7 @@ import i18n from '../../../i18n';
 import KeyStatus from './KeyStatus';
 import CertificateStatus from './CertificateStatus';
 import {
-    DNS_OVER_QUIC_PORT, DNS_OVER_TLS_PORT, FORM_NAME, STANDARD_HTTPS_PORT, ENCRYPTION_SOURCE
+    DNS_OVER_QUIC_PORT, DNS_OVER_TLS_PORT, FORM_NAME, STANDARD_HTTPS_PORT, ENCRYPTION_SOURCE,
 } from '../../../helpers/constants';
 
 const validate = (values) => {
@@ -46,6 +46,7 @@ const clearFields = (change, setTlsConfig, t) => {
         server_name: '',
         force_https: false,
         enabled: false,
+        use_saved_key: false,
     };
     // eslint-disable-next-line no-alert
     if (window.confirm(t('encryption_reset'))) {
@@ -350,24 +351,24 @@ let Form = (props) => {
                             />
                         )}
                         {privateKeySource === ENCRYPTION_SOURCE.CONTENT && [
-                            <div
-                                className="form__group form__group--settings mb-2"
+                            <Field
+                                id="use_saved_key"
                                 key="use_saved_key"
-                            >
-                                <Field
-                                    id="use_saved_key"
-                                    name="use_saved_key"
-                                    type="checkbox"
-                                    component={CheckboxField}
-                                    placeholder={t('use_saved_key')}
-                                    onChange={(event) => {
-                                        if (event.target.checked) {
-                                            change("private_key", "")
-                                        }
-                                        handleChange && handleChange(event)
-                                    }}
-                                />
-                            </div>,
+                                name="use_saved_key"
+                                type="checkbox"
+                                className="form__group form__group--settings mb-2"
+                                component={CheckboxField}
+                                disabled={!isEnabled}
+                                placeholder={t('use_saved_key')}
+                                onChange={(event) => {
+                                    if (event.target.checked) {
+                                        change('private_key', '');
+                                    }
+                                    if (handleChange) {
+                                        handleChange(event);
+                                    }
+                                }}
+                            />,
                             <Field
                                 id="private_key"
                                 key="private_key"
@@ -377,8 +378,8 @@ let Form = (props) => {
                                 className="form-control form-control--textarea"
                                 placeholder={t('encryption_key_input')}
                                 onChange={handleChange}
-                                disabled={!isEnabled  || useSavedKey}
-                            />
+                                disabled={!isEnabled || useSavedKey}
+                            />,
                         ]}
                     </div>
                     <div className="form__status">
@@ -466,7 +467,7 @@ Form = connect((state) => {
         privateKeyPath,
         certificateSource,
         privateKeySource,
-        useSavedKey
+        useSavedKey,
     };
 })(Form);
 

@@ -3,7 +3,7 @@ import PropTypes from 'prop-types';
 import { withTranslation } from 'react-i18next';
 import debounce from 'lodash/debounce';
 
-import { DEBOUNCE_TIMEOUT, ENCRYPTION_SOURCE } from '../../../helpers/constants';
+import { DEBOUNCE_TIMEOUT, ENCRYPTION_SOURCE, USE_SAVED_PRIVATE_KEY } from '../../../helpers/constants';
 import Form from './Form';
 import Card from '../../ui/Card';
 import PageTitle from '../../ui/PageTitle';
@@ -29,23 +29,28 @@ class Encryption extends Component {
     }, DEBOUNCE_TIMEOUT);
 
     getInitialValues = (data) => {
-        const { certificate_chain, private_key, use_saved_key } = data;
+        const { certificate_chain, private_key } = data;
         const certificate_source = certificate_chain
             ? ENCRYPTION_SOURCE.CONTENT
             : ENCRYPTION_SOURCE.PATH;
-        const key_source = private_key || use_saved_key
+        const key_source = private_key
             ? ENCRYPTION_SOURCE.CONTENT
             : ENCRYPTION_SOURCE.PATH;
+        const use_saved_key = private_key === USE_SAVED_PRIVATE_KEY;
 
         return {
             ...data,
             certificate_source,
             key_source,
+            use_saved_key,
+            private_key: use_saved_key ? '' : private_key,
         };
     };
 
     getSubmitValues = (values) => {
-        const { certificate_source, key_source, ...config } = values;
+        const {
+            certificate_source, key_source, use_saved_key, ...config
+        } = values;
 
         if (certificate_source === ENCRYPTION_SOURCE.PATH) {
             config.certificate_chain = '';
@@ -53,10 +58,14 @@ class Encryption extends Component {
             config.certificate_path = '';
         }
 
-        if (values.key_source === ENCRYPTION_SOURCE.PATH) {
+        if (key_source === ENCRYPTION_SOURCE.PATH) {
             config.private_key = '';
         } else {
             config.private_key_path = '';
+
+            if (use_saved_key) {
+                config.private_key = USE_SAVED_PRIVATE_KEY;
+            }
         }
 
         return config;
@@ -75,7 +84,6 @@ class Encryption extends Component {
             private_key,
             certificate_path,
             private_key_path,
-            use_saved_key
         } = encryption;
 
         const initialValues = this.getInitialValues({
@@ -89,7 +97,6 @@ class Encryption extends Component {
             private_key,
             certificate_path,
             private_key_path,
-            use_saved_key
         });
 
         return (

@@ -15,7 +15,7 @@ and this project adheres to
 
 ### Added
 
-- Added use saved option when setting private key as string ([#1898])
+- `Use saved` option when setting private key as string ([#1898]).
 - Static IP address detection on FreeBSD ([#3289]).
 - Optimistic cache ([#2145]).
 - New possible value of `6h` for `querylog_interval` setting ([#2504]).
@@ -44,6 +44,7 @@ and this project adheres to
 
 ### Changed
 
+- Don't show the private key in API responses if it was saved as a string ([#1898]).
 - Better OpenWrt detection ([#3435]).
 - DNS-over-HTTPS queries that come from HTTP proxies in the `trusted_proxies`
   list now use the real IP address of the client instead of the address of the
@@ -66,7 +67,6 @@ and this project adheres to
 
 ### Fixed
 
-- If private key was saved as a string, then hide it from the UI ([#1898])
 - `reload` service action on macOS and FreeBSD ([#3457]).
 - Inaccurate using of service actions in the installation script ([#3450]).
 - Client ID checking ([#3437]).

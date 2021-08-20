@@ -2074,7 +2074,7 @@
           'description': 'Base64 string with PEM-encoded certificates chain'
         'private_key':
           'type': 'string'
-          'description': 'Base64 string with PEM-encoded private key'
+          'description': 'Base64 string with PEM-encoded private key or `use_saved` constant if the private key was previosly saved as string'
         'certificate_path':
           'type': 'string'
           'description': 'Path to certificate file'

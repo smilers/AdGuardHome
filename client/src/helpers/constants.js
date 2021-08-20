@@ -650,3 +650,5 @@ export const MOBILE_CONFIG_LINKS = {
     DOT: 'apple/dot.mobileconfig',
     DOH: 'apple/doh.mobileconfig',
 };
+
+export const USE_SAVED_PRIVATE_KEY = 'use_saved';

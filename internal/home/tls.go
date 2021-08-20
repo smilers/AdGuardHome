@@ -36,6 +36,10 @@ type TLSMod struct {
 	conf        tlsConfigSettings
 }
 
+const (
+	useSavedPrivateKey = "use_saved"
+)
+
 // Create TLS module
 func tlsCreate(conf tlsConfigSettings) *TLSMod {
 	t := &TLSMod{}
@@ -210,26 +214,19 @@ type tlsConfigStatus struct {
 
 // field ordering is important -- yaml fields will mirror ordering from here
 type tlsConfig struct {
-	tlsConfigStatus          `json:",inline"`
-	tlsConfigSettingsWithKey `json:",inline"`
-}
-
-type tlsConfigSettingsWithKey struct {
+	tlsConfigStatus   `json:",inline"`
 	tlsConfigSettings `json:",inline"`
-	// If private key saved as string, we set this flag to true and omit it from answer.
-	UseSavedKey bool `json:"use_saved_key,inline"`
 }
 
 func (t *TLSMod) handleTLSStatus(w http.ResponseWriter, _ *http.Request) {
 	t.confLock.Lock()
 	data := tlsConfig{
-		tlsConfigSettingsWithKey: tlsConfigSettingsWithKey{
-			tlsConfigSettings: t.conf,
-		},
-		tlsConfigStatus: t.status,
+		tlsConfigStatus:   t.status,
+		tlsConfigSettings: t.conf,
 	}
 	t.confLock.Unlock()
-	marshalTLS(w, data)
+	hidePrivateKey := data.PrivateKey != ""
+	marshalTLS(w, data, hidePrivateKey)
 }
 
 func (t *TLSMod) handleTLSValidate(w http.ResponseWriter, r *http.Request) {
@@ -239,7 +236,8 @@ func (t *TLSMod) handleTLSValidate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if setts.UseSavedKey {
+	hidePrivateKey := setts.PrivateKey == useSavedPrivateKey
+	if hidePrivateKey {
 		setts.PrivateKey = t.conf.PrivateKey
 	}
 
@@ -249,15 +247,15 @@ func (t *TLSMod) handleTLSValidate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := tlsConfigStatus{}
-	if tlsLoadConfig(&setts.tlsConfigSettings, &status) {
+	if tlsLoadConfig(&setts, &status) {
 		status = validateCertificates(string(setts.CertificateChainData), string(setts.PrivateKeyData), setts.ServerName)
 	}
 
 	data := tlsConfig{
-		tlsConfigSettingsWithKey: setts,
-		tlsConfigStatus:          status,
+		tlsConfigSettings: setts,
+		tlsConfigStatus:   status,
 	}
-	marshalTLS(w, data)
+	marshalTLS(w, data, hidePrivateKey)
 }
 
 func (t *TLSMod) setConfig(newConf tlsConfigSettings, status tlsConfigStatus) (restartHTTPS bool) {
@@ -302,7 +300,8 @@ func (t *TLSMod) handleTLSConfigure(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if data.UseSavedKey {
+	hidePrivateKey := data.PrivateKey == useSavedPrivateKey
+	if hidePrivateKey {
 		data.PrivateKey = t.conf.PrivateKey
 	}
 
@@ -312,19 +311,19 @@ func (t *TLSMod) handleTLSConfigure(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := tlsConfigStatus{}
-	if !tlsLoadConfig(&data.tlsConfigSettings, &status) {
+	if !tlsLoadConfig(&data, &status) {
 		data2 := tlsConfig{
-			tlsConfigSettingsWithKey: data,
-			tlsConfigStatus:          t.status,
+			tlsConfigSettings: data,
+			tlsConfigStatus:   t.status,
 		}
-		marshalTLS(w, data2)
+		marshalTLS(w, data2, hidePrivateKey)
 
 		return
 	}
 
 	status = validateCertificates(string(data.CertificateChainData), string(data.PrivateKeyData), data.ServerName)
 
-	restartHTTPS := t.setConfig(data.tlsConfigSettings, status)
+	restartHTTPS := t.setConfig(data, status)
 	t.setCertFileTime()
 	onConfigModified()
 
@@ -336,11 +335,11 @@ func (t *TLSMod) handleTLSConfigure(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data2 := tlsConfig{
-		tlsConfigSettingsWithKey: data,
-		tlsConfigStatus:          t.status,
+		tlsConfigSettings: data,
+		tlsConfigStatus:   t.status,
 	}
 
-	marshalTLS(w, data2)
+	marshalTLS(w, data2, hidePrivateKey)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
@@ -351,7 +350,7 @@ func (t *TLSMod) handleTLSConfigure(w http.ResponseWriter, r *http.Request) {
 	// goroutine due to the same reason.
 	if restartHTTPS {
 		go func() {
-			Context.web.TLSConfigChanged(context.Background(), data.tlsConfigSettings)
+			Context.web.TLSConfigChanged(context.Background(), data)
 		}()
 	}
 }
@@ -530,8 +529,8 @@ func parsePrivateKey(der []byte) (crypto.PrivateKey, string, error) {
 }
 
 // unmarshalTLS handles base64-encoded certificates transparently
-func unmarshalTLS(r *http.Request) (tlsConfigSettingsWithKey, error) {
-	data := tlsConfigSettingsWithKey{}
+func unmarshalTLS(r *http.Request) (tlsConfigSettings, error) {
+	data := tlsConfigSettings{}
 	err := json.NewDecoder(r.Body).Decode(&data)
 	if err != nil {
 		return data, fmt.Errorf("failed to parse new TLS config json: %w", err)
@@ -566,7 +565,7 @@ func unmarshalTLS(r *http.Request) (tlsConfigSettingsWithKey, error) {
 	return data, nil
 }
 
-func marshalTLS(w http.ResponseWriter, data tlsConfig) {
+func marshalTLS(w http.ResponseWriter, data tlsConfig, hidePrivateKey bool) {
 	w.Header().Set("Content-Type", "application/json")
 
 	if data.CertificateChain != "" {
@@ -574,9 +573,11 @@ func marshalTLS(w http.ResponseWriter, data tlsConfig) {
 		data.CertificateChain = encoded
 	}
 
-	if data.PrivateKey != "" {
-		data.UseSavedKey = true
-		data.PrivateKey = ""
+	if hidePrivateKey {
+		data.PrivateKey = base64.StdEncoding.EncodeToString([]byte(useSavedPrivateKey))
+	} else if data.PrivateKey != "" {
+		encoded := base64.StdEncoding.EncodeToString([]byte(data.PrivateKey))
+		data.PrivateKey = encoded
 	}
 
 	err := json.NewEncoder(w).Encode(data)
