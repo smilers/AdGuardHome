@@ -14,7 +14,7 @@
     },
     "license": "ISC",
     "dependencies": {
-        "@adguard/translate": "^0.2.0",
+        "@adguard/translate": "^0.2.5",
         "@ant-design/icons": "^4.4.0",
         "@sentry/react": "^5.27.0",
         "antd": "^4.7.2",
