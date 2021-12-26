@@ -4741,10 +4741,10 @@ mobx-react-lite@^3.0.1:
   resolved "https://registry.yarnpkg.com/mobx-react-lite/-/mobx-react-lite-3.1.7.tgz#8896e9ec4f3d2117ddc0a5bfc60802c39a5258f4"
   integrity sha512-G6kgur98RrEpoi563ERzxlSwn606xY6Ay4BOtfYXl/QaHZYXbhbCe3YJGROPU2ao4f2bfhnt8iZW3YnBW2BqXQ==
 
-mobx@^6.0.1:
-  version "6.0.5"
-  resolved "https://registry.yarnpkg.com/mobx/-/mobx-6.0.5.tgz#617e716b7aa81d5b700598af3bb1643ff2144410"
-  integrity sha512-Q3/GiSj/QyazDn1n44PjdiMlokCE6gVs85BnFR0xCJmkF2d34k/ZnWAEG7wGbnJYEi+0f5CdvzDquBiKeo56bA==
+mobx@^6.3.8:
+  version "6.3.10"
+  resolved "https://registry.yarnpkg.com/mobx/-/mobx-6.3.10.tgz#c3bc715c8f03717b9a2329f9697d42b7998d42e0"
+  integrity sha512-lfuIN5TGXBNy/5s3ggr1L+IbD+LvfZVlj5q1ZuqyV9AfMtunYQvE8G0WfewS9tgIR3I1q8HJEEbcAOsxEgLwRw==
 
 moment@^2.24.0, moment@^2.25.3:
   version "2.29.1"
