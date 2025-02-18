@@ -3,61 +3,57 @@ package dnsforward
 import (
 	"encoding/json"
 	"fmt"
-	"net"
 	"net/http"
+	"net/netip"
+	"slices"
 	"strings"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
-	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/log"
-	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/stringutil"
 	"github.com/AdguardTeam/urlfilter"
 	"github.com/AdguardTeam/urlfilter/filterlist"
+	"github.com/AdguardTeam/urlfilter/rules"
 )
 
-// accessCtx controls IP and client blocking that takes place before all other
-// processing.  An accessCtx is safe for concurrent use.
-type accessCtx struct {
-	allowedIPs *netutil.IPMap
-	blockedIPs *netutil.IPMap
+// accessManager controls IP and client blocking that takes place before all
+// other processing.  An accessManager is safe for concurrent use.
+type accessManager struct {
+	allowedIPs *container.MapSet[netip.Addr]
+	blockedIPs *container.MapSet[netip.Addr]
 
-	allowedClientIDs *stringutil.Set
-	blockedClientIDs *stringutil.Set
+	allowedClientIDs *container.MapSet[string]
+	blockedClientIDs *container.MapSet[string]
 
+	// TODO(s.chzhen):  Use [aghnet.IgnoreEngine].
 	blockedHostsEng *urlfilter.DNSEngine
 
-	// TODO(a.garipov): Create a type for a set of IP networks.
-	// netutil.IPNetSet?
-	allowedNets []*net.IPNet
-	blockedNets []*net.IPNet
+	// TODO(a.garipov): Create a type for an efficient tree set of IP networks.
+	allowedNets []netip.Prefix
+	blockedNets []netip.Prefix
 }
-
-// unit is a convenient alias for struct{}
-type unit = struct{}
 
 // processAccessClients is a helper for processing a list of client strings,
 // which may be an IP address, a CIDR, or a ClientID.
 func processAccessClients(
 	clientStrs []string,
-	ips *netutil.IPMap,
-	nets *[]*net.IPNet,
-	clientIDs *stringutil.Set,
+	ips *container.MapSet[netip.Addr],
+	nets *[]netip.Prefix,
+	clientIDs *container.MapSet[string],
 ) (err error) {
 	for i, s := range clientStrs {
-		if ip := net.ParseIP(s); ip != nil {
-			ips.Set(ip, unit{})
-		} else if cidrIP, ipnet, cidrErr := net.ParseCIDR(s); cidrErr == nil {
-			ipnet.IP = cidrIP
+		var ip netip.Addr
+		var ipnet netip.Prefix
+		if ip, err = netip.ParseAddr(s); err == nil {
+			ips.Add(ip)
+		} else if ipnet, err = netip.ParsePrefix(s); err == nil {
 			*nets = append(*nets, ipnet)
 		} else {
-			idErr := ValidateClientID(s)
-			if idErr != nil {
-				return fmt.Errorf(
-					"value %q at index %d: bad ip, cidr, or clientid",
-					s,
-					i,
-				)
+			err = ValidateClientID(s)
+			if err != nil {
+				return fmt.Errorf("value %q at index %d: bad ip, cidr, or clientid", s, i)
 			}
 
 			clientIDs.Add(s)
@@ -68,13 +64,13 @@ func processAccessClients(
 }
 
 // newAccessCtx creates a new accessCtx.
-func newAccessCtx(allowed, blocked, blockedHosts []string) (a *accessCtx, err error) {
-	a = &accessCtx{
-		allowedIPs: netutil.NewIPMap(0),
-		blockedIPs: netutil.NewIPMap(0),
+func newAccessCtx(allowed, blocked, blockedHosts []string) (a *accessManager, err error) {
+	a = &accessManager{
+		allowedIPs: container.NewMapSet[netip.Addr](),
+		blockedIPs: container.NewMapSet[netip.Addr](),
 
-		allowedClientIDs: stringutil.NewSet(),
-		blockedClientIDs: stringutil.NewSet(),
+		allowedClientIDs: container.NewMapSet[string](),
+		blockedClientIDs: container.NewMapSet[string](),
 	}
 
 	err = processAccessClients(allowed, a.allowedIPs, &a.allowedNets, a.allowedClientIDs)
@@ -94,7 +90,7 @@ func newAccessCtx(allowed, blocked, blockedHosts []string) (a *accessCtx, err er
 
 	lists := []filterlist.RuleList{
 		&filterlist.StringRuleList{
-			ID:             int(0),
+			ID:             0,
 			RulesText:      b.String(),
 			IgnoreCosmetic: true,
 		},
@@ -111,16 +107,16 @@ func newAccessCtx(allowed, blocked, blockedHosts []string) (a *accessCtx, err er
 }
 
 // allowlistMode returns true if this *accessCtx is in the allowlist mode.
-func (a *accessCtx) allowlistMode() (ok bool) {
+func (a *accessManager) allowlistMode() (ok bool) {
 	return a.allowedIPs.Len() != 0 || a.allowedClientIDs.Len() != 0 || len(a.allowedNets) != 0
 }
 
 // isBlockedClientID returns true if the ClientID should be blocked.
-func (a *accessCtx) isBlockedClientID(id string) (ok bool) {
+func (a *accessManager) isBlockedClientID(id string) (ok bool) {
 	allowlistMode := a.allowlistMode()
 	if id == "" {
-		// In allowlist mode, consider requests without client IDs
-		// blocked by default.
+		// In allowlist mode, consider requests without ClientIDs blocked by
+		// default.
 		return allowlistMode
 	}
 
@@ -132,15 +128,18 @@ func (a *accessCtx) isBlockedClientID(id string) (ok bool) {
 }
 
 // isBlockedHost returns true if host should be blocked.
-func (a *accessCtx) isBlockedHost(host string) (ok bool) {
-	_, ok = a.blockedHostsEng.Match(strings.ToLower(host))
+func (a *accessManager) isBlockedHost(host string, qt rules.RRType) (ok bool) {
+	_, ok = a.blockedHostsEng.MatchRequest(&urlfilter.DNSRequest{
+		Hostname: host,
+		DNSType:  qt,
+	})
 
 	return ok
 }
 
 // isBlockedIP returns the status of the IP address blocking as well as the rule
 // that blocked it.
-func (a *accessCtx) isBlockedIP(ip net.IP) (blocked bool, rule string) {
+func (a *accessManager) isBlockedIP(ip netip.Addr) (blocked bool, rule string) {
 	blocked = true
 	ips := a.blockedIPs
 	ipnets := a.blockedNets
@@ -152,12 +151,15 @@ func (a *accessCtx) isBlockedIP(ip net.IP) (blocked bool, rule string) {
 		ipnets = a.allowedNets
 	}
 
-	if _, ok := ips.Get(ip); ok {
+	if ips.Has(ip) {
 		return blocked, ip.String()
 	}
 
 	for _, ipnet := range ipnets {
-		if ipnet.Contains(ip) {
+		// Remove zone before checking because prefixes stip zones.
+		//
+		// TODO(d.kolyshev):  Cover with tests.
+		if ipnet.Contains(ip.WithZone("")) {
 			return blocked, ipnet.String()
 		}
 	}
@@ -176,80 +178,58 @@ func (s *Server) accessListJSON() (j accessListJSON) {
 	defer s.serverLock.RUnlock()
 
 	return accessListJSON{
-		AllowedClients:    stringutil.CloneSlice(s.conf.AllowedClients),
-		DisallowedClients: stringutil.CloneSlice(s.conf.DisallowedClients),
-		BlockedHosts:      stringutil.CloneSlice(s.conf.BlockedHosts),
+		AllowedClients:    slices.Clone(s.conf.AllowedClients),
+		DisallowedClients: slices.Clone(s.conf.DisallowedClients),
+		BlockedHosts:      slices.Clone(s.conf.BlockedHosts),
 	}
 }
 
+// handleAccessList handles requests to the GET /control/access/list endpoint.
 func (s *Server) handleAccessList(w http.ResponseWriter, r *http.Request) {
-	j := s.accessListJSON()
-
-	w.Header().Set("Content-Type", "application/json")
-	err := json.NewEncoder(w).Encode(j)
-	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "encoding response: %s", err)
-
-		return
-	}
-}
-
-func isUniq(slice []string) (ok bool, uniqueMap map[string]unit) {
-	exists := make(map[string]unit)
-	for _, key := range slice {
-		if _, has := exists[key]; has {
-			return false, nil
-		}
-		exists[key] = unit{}
-	}
-	return true, exists
-}
-
-func intersect(mapA, mapB map[string]unit) bool {
-	for key := range mapA {
-		if _, has := mapB[key]; has {
-			return true
-		}
-	}
-	return false
+	aghhttp.WriteJSONResponseOK(w, r, s.accessListJSON())
 }
 
 // validateAccessSet checks the internal accessListJSON lists.  To search for
 // duplicates, we cannot compare the new stringutil.Set and []string, because
 // creating a set for a large array can be an unnecessary algorithmic complexity
-func validateAccessSet(list accessListJSON) (err error) {
-	const (
-		errAllowedDup    errors.Error = "duplicates in allowed clients"
-		errDisallowedDup errors.Error = "duplicates in disallowed clients"
-		errBlockedDup    errors.Error = "duplicates in blocked hosts"
-		errIntersect     errors.Error = "some items in allowed and " +
-			"disallowed lists at the same time"
-	)
-
-	ok, allowedClients := isUniq(list.AllowedClients)
-	if !ok {
-		return errAllowedDup
+func validateAccessSet(list *accessListJSON) (err error) {
+	allowed, err := validateStrUniq(list.AllowedClients)
+	if err != nil {
+		return fmt.Errorf("validating allowed clients: %w", err)
 	}
 
-	ok, disallowedClients := isUniq(list.DisallowedClients)
-	if !ok {
-		return errDisallowedDup
+	disallowed, err := validateStrUniq(list.DisallowedClients)
+	if err != nil {
+		return fmt.Errorf("validating disallowed clients: %w", err)
 	}
 
-	ok, _ = isUniq(list.BlockedHosts)
-	if !ok {
-		return errBlockedDup
+	_, err = validateStrUniq(list.BlockedHosts)
+	if err != nil {
+		return fmt.Errorf("validating blocked hosts: %w", err)
 	}
 
-	if intersect(allowedClients, disallowedClients) {
-		return errIntersect
+	merged := allowed.Merge(disallowed)
+	err = merged.Validate()
+	if err != nil {
+		return fmt.Errorf("items in allowed and disallowed clients intersect: %w", err)
 	}
 
 	return nil
 }
 
+// validateStrUniq returns an informative error if clients are not unique.
+func validateStrUniq(clients []string) (uc aghalg.UniqChecker[string], err error) {
+	uc = make(aghalg.UniqChecker[string], len(clients))
+	for _, c := range clients {
+		uc.Add(c)
+	}
+
+	return uc, uc.Validate()
+}
+
+// handleAccessSet handles requests to the POST /control/access/set endpoint.
 func (s *Server) handleAccessSet(w http.ResponseWriter, r *http.Request) {
-	list := accessListJSON{}
+	list := &accessListJSON{}
 	err := json.NewDecoder(r.Body).Decode(&list)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "decoding request: %s", err)
@@ -264,7 +244,7 @@ func (s *Server) handleAccessSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var a *accessCtx
+	var a *accessManager
 	a, err = newAccessCtx(list.AllowedClients, list.DisallowedClients, list.BlockedHosts)
 	if err != nil {
 		aghhttp.Error(r, w, http.StatusBadRequest, "creating access ctx: %s", err)

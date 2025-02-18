@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/golibs/netutil"
 	"golang.org/x/net/icmp"
@@ -65,39 +66,42 @@ func hwAddrToLinkLayerAddr(hwa net.HardwareAddr) (lla []byte, err error) {
 }
 
 // Create an ICMPv6.RouterAdvertisement packet with all necessary options.
+// Data scheme:
 //
-// ICMPv6:
-// type[1]
-// code[1]
-// chksum[2]
-// body (RouterAdvertisement):
-//   Cur Hop Limit[1]
-//   Flags[1]: MO......
-//   Router Lifetime[2]
-//   Reachable Time[4]
-//   Retrans Timer[4]
-//   Option=Prefix Information(3):
-//     Type[1]
-//     Length * 8bytes[1]
-//     Prefix Length[1]
-//     Flags[1]: LA......
-//     Valid Lifetime[4]
-//     Preferred Lifetime[4]
-//     Reserved[4]
-//     Prefix[16]
-//   Option=MTU(5):
-//     Type[1]
-//     Length * 8bytes[1]
-//     Reserved[2]
-//     MTU[4]
-//   Option=Source link-layer address(1):
-//     Link-Layer Address[8/24]
-//   Option=Recursive DNS Server(25):
-//     Type[1]
-//     Length * 8bytes[1]
-//     Reserved[2]
-//     Lifetime[4]
-//     Addresses of IPv6 Recursive DNS Servers[16]
+//	ICMPv6:
+//	- type[1]
+//	- code[1]
+//	- chksum[2]
+//	- body (RouterAdvertisement):
+//	  - Cur Hop Limit[1]
+//	  - Flags[1]: MO......
+//	  - Router Lifetime[2]
+//	  - Reachable Time[4]
+//	  - Retrans Timer[4]
+//	  - Option=Prefix Information(3):
+//	    - Type[1]
+//	    - Length * 8bytes[1]
+//	    - Prefix Length[1]
+//	    - Flags[1]: LA......
+//	    - Valid Lifetime[4]
+//	    - Preferred Lifetime[4]
+//	    - Reserved[4]
+//	    - Prefix[16]
+//	  - Option=MTU(5):
+//	    - Type[1]
+//	    - Length * 8bytes[1]
+//	    - Reserved[2]
+//	    - MTU[4]
+//	  - Option=Source link-layer address(1):
+//	    - Link-Layer Address[8/24]
+//	  - Option=Recursive DNS Server(25):
+//	    - Type[1]
+//	    - Length * 8bytes[1]
+//	    - Reserved[2]
+//	    - Lifetime[4]
+//	    - Addresses of IPv6 Recursive DNS Servers[16]
+//
+// TODO(a.garipov): Replace with an existing implementation from a dependency.
 func createICMPv6RAPacket(params icmpv6RA) (data []byte, err error) {
 	var lla []byte
 	lla, err = hwAddrToLinkLayerAddr(params.sourceLinkLayerAddress)
@@ -192,16 +196,15 @@ func createICMPv6RAPacket(params icmpv6RA) (data []byte, err error) {
 	return data, nil
 }
 
-// Init - initialize RA module
+// Init initializes RA module.
 func (ra *raCtx) Init() (err error) {
 	ra.stop.Store(0)
 	ra.conn = nil
-	if !(ra.raAllowSLAAC || ra.raSLAACOnly) {
+	if !ra.raAllowSLAAC && !ra.raSLAACOnly {
 		return nil
 	}
 
-	log.Debug("dhcpv6 ra: source IP address: %s  DNS IP address: %s",
-		ra.ipAddr, ra.dnsIPAddr)
+	log.Debug("dhcpv6 ra: source IP address: %s  DNS IP address: %s", ra.ipAddr, ra.dnsIPAddr)
 
 	params := icmpv6RA{
 		managedAddressConfiguration: !ra.raSLAACOnly,
@@ -220,18 +223,15 @@ func (ra *raCtx) Init() (err error) {
 		return fmt.Errorf("creating packet: %w", err)
 	}
 
-	success := false
 	ipAndScope := ra.ipAddr.String() + "%" + ra.ifaceName
 	ra.conn, err = icmp.ListenPacket("ip6:ipv6-icmp", ipAndScope)
 	if err != nil {
 		return fmt.Errorf("dhcpv6 ra: icmp.ListenPacket: %w", err)
 	}
+
 	defer func() {
-		if !success {
-			derr := ra.Close()
-			if derr != nil {
-				log.Error("closing context: %s", derr)
-			}
+		if err != nil {
+			err = errors.WithDeferred(err, ra.Close())
 		}
 	}()
 
@@ -266,7 +266,6 @@ func (ra *raCtx) Init() (err error) {
 		log.Debug("dhcpv6 ra: loop exit")
 	}()
 
-	success = true
 	return nil
 }
 

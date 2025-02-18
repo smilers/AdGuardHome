@@ -1,23 +1,34 @@
 //go:build windows
-// +build windows
 
 package dhcpd
 
 // 'u-root/u-root' package, a dependency of 'insomniacslk/dhcp' package, doesn't build on Windows
 
-import "net"
+import (
+	"net"
+	"net/netip"
+
+	"github.com/AdguardTeam/AdGuardHome/internal/dhcpsvc"
+)
 
 type winServer struct{}
 
-func (s *winServer) ResetLeases(_ []*Lease) (err error)           { return nil }
-func (s *winServer) GetLeases(_ GetLeasesFlags) (leases []*Lease) { return nil }
-func (s *winServer) getLeasesRef() []*Lease                       { return nil }
-func (s *winServer) AddStaticLease(_ *Lease) (err error)          { return nil }
-func (s *winServer) RemoveStaticLease(_ *Lease) (err error)       { return nil }
-func (s *winServer) FindMACbyIP(ip net.IP) (mac net.HardwareAddr) { return nil }
-func (s *winServer) WriteDiskConfig4(c *V4ServerConf)             {}
-func (s *winServer) WriteDiskConfig6(c *V6ServerConf)             {}
-func (s *winServer) Start() (err error)                           { return nil }
-func (s *winServer) Stop() (err error)                            { return nil }
-func v4Create(conf V4ServerConf) (DHCPServer, error)              { return &winServer{}, nil }
-func v6Create(conf V6ServerConf) (DHCPServer, error)              { return &winServer{}, nil }
+// type check
+var _ DHCPServer = winServer{}
+
+func (winServer) ResetLeases(_ []*dhcpsvc.Lease) (err error)           { return nil }
+func (winServer) GetLeases(_ GetLeasesFlags) (leases []*dhcpsvc.Lease) { return nil }
+func (winServer) getLeasesRef() []*dhcpsvc.Lease                       { return nil }
+func (winServer) AddStaticLease(_ *dhcpsvc.Lease) (err error)          { return nil }
+func (winServer) RemoveStaticLease(_ *dhcpsvc.Lease) (err error)       { return nil }
+func (winServer) UpdateStaticLease(_ *dhcpsvc.Lease) (err error)       { return nil }
+func (winServer) FindMACbyIP(_ netip.Addr) (mac net.HardwareAddr)      { return nil }
+func (winServer) WriteDiskConfig4(_ *V4ServerConf)                     {}
+func (winServer) WriteDiskConfig6(_ *V6ServerConf)                     {}
+func (winServer) Start() (err error)                                   { return nil }
+func (winServer) Stop() (err error)                                    { return nil }
+func (winServer) HostByIP(_ netip.Addr) (host string)                  { return "" }
+func (winServer) IPByHost(_ string) (ip netip.Addr)                    { return netip.Addr{} }
+
+func v4Create(_ *V4ServerConf) (s DHCPServer, err error) { return winServer{}, nil }
+func v6Create(_ V6ServerConf) (s DHCPServer, err error)  { return winServer{}, nil }

@@ -1,9 +1,9 @@
 //go:build openbsd
-// +build openbsd
 
 package home
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"os/signal"
@@ -15,7 +15,6 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
-	"github.com/AdguardTeam/golibs/stringutil"
 	"github.com/kardianos/service"
 )
 
@@ -28,10 +27,11 @@ import (
 //
 // TODO(e.burkov):  Perhaps, file a PR to github.com/kardianos/service.
 
-// sysVersion is the version of local service.System interface
-// implementation.
+// sysVersion is the version of local service.System interface implementation.
 const sysVersion = "openbsd-runcom"
 
+// chooseSystem checks the current system detected and substitutes it with local
+// implementation if needed.
 func chooseSystem() {
 	service.ChooseSystem(openbsdSystem{})
 }
@@ -76,7 +76,7 @@ func (*openbsdRunComService) Platform() (p string) {
 
 // String implements service.Service interface for *openbsdRunComService.
 func (s *openbsdRunComService) String() string {
-	return stringutil.Coalesce(s.cfg.DisplayName, s.cfg.Name)
+	return cmp.Or(s.cfg.DisplayName, s.cfg.Name)
 }
 
 // getBool returns the value of the given name from kv, assuming the value is a
@@ -161,7 +161,7 @@ rc_cmd $1
 
 // template returns the script template to put into rc.d.
 func (s *openbsdRunComService) template() (t *template.Template) {
-	tf := map[string]interface{}{
+	tf := map[string]any{
 		"args": func(sl []string) string {
 			return `"` + strings.Join(sl, " ") + `"`
 		},
@@ -174,7 +174,7 @@ func (s *openbsdRunComService) template() (t *template.Template) {
 	)))
 }
 
-// execPath returns the absolute path to the excutable to be run as a service.
+// execPath returns the absolute path to the executable to be run as a service.
 func (s *openbsdRunComService) execPath() (path string, err error) {
 	if c := s.cfg; c != nil && len(c.Executable) != 0 {
 		return filepath.Abs(c.Executable)
@@ -315,12 +315,13 @@ func (s *openbsdRunComService) runCom(cmd string) (out string, err error) {
 	// TODO(e.burkov):  It's possible that os.ErrNotExist is caused by
 	// something different than the service script's non-existence.  Keep it
 	// in mind, when replace the aghos.RunCommand.
-	_, out, err = aghos.RunCommand(scriptPath, cmd)
+	var outData []byte
+	_, outData, err = aghos.RunCommand(scriptPath, cmd)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", service.ErrNotInstalled
 	}
 
-	return out, err
+	return string(outData), err
 }
 
 // Status implements service.Service interface for *openbsdRunComService.
@@ -390,42 +391,42 @@ func newSysLogger(_ string, _ chan<- error) (service.Logger, error) {
 type sysLogger struct{}
 
 // Error implements service.Logger interface for sysLogger.
-func (sysLogger) Error(v ...interface{}) error {
+func (sysLogger) Error(v ...any) error {
 	log.Error(fmt.Sprint(v...))
 
 	return nil
 }
 
 // Warning implements service.Logger interface for sysLogger.
-func (sysLogger) Warning(v ...interface{}) error {
+func (sysLogger) Warning(v ...any) error {
 	log.Info("warning: %s", fmt.Sprint(v...))
 
 	return nil
 }
 
 // Info implements service.Logger interface for sysLogger.
-func (sysLogger) Info(v ...interface{}) error {
+func (sysLogger) Info(v ...any) error {
 	log.Info(fmt.Sprint(v...))
 
 	return nil
 }
 
 // Errorf implements service.Logger interface for sysLogger.
-func (sysLogger) Errorf(format string, a ...interface{}) error {
+func (sysLogger) Errorf(format string, a ...any) error {
 	log.Error(format, a...)
 
 	return nil
 }
 
 // Warningf implements service.Logger interface for sysLogger.
-func (sysLogger) Warningf(format string, a ...interface{}) error {
+func (sysLogger) Warningf(format string, a ...any) error {
 	log.Info("warning: %s", fmt.Sprintf(format, a...))
 
 	return nil
 }
 
 // Infof implements service.Logger interface for sysLogger.
-func (sysLogger) Infof(format string, a ...interface{}) error {
+func (sysLogger) Infof(format string, a ...any) error {
 	log.Info(format, a...)
 
 	return nil

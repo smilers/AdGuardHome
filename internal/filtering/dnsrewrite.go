@@ -1,6 +1,7 @@
 package filtering
 
 import (
+	"github.com/AdguardTeam/urlfilter"
 	"github.com/AdguardTeam/urlfilter/rules"
 	"github.com/miekg/dns"
 )
@@ -29,13 +30,13 @@ func (d *DNSFilter) processDNSRewrites(dnsr []*rules.NetworkRule) (res Result) {
 		if dr.NewCNAME != "" {
 			// NewCNAME rules have a higher priority than other rules.
 			rules = []*ResultRule{{
-				FilterListID: int64(nr.GetFilterListID()),
+				FilterListID: nr.GetFilterListID(),
 				Text:         nr.RuleText,
 			}}
 
 			return Result{
-				Reason:    RewrittenRule,
 				Rules:     rules,
+				Reason:    RewrittenRule,
 				CanonName: dr.NewCNAME,
 			}
 		}
@@ -45,14 +46,14 @@ func (d *DNSFilter) processDNSRewrites(dnsr []*rules.NetworkRule) (res Result) {
 			dnsrr.RCode = dr.RCode
 			dnsrr.Response[dr.RRType] = append(dnsrr.Response[dr.RRType], dr.Value)
 			rules = append(rules, &ResultRule{
-				FilterListID: int64(nr.GetFilterListID()),
+				FilterListID: nr.GetFilterListID(),
 				Text:         nr.RuleText,
 			})
 		default:
 			// RcodeRefused and other such codes have higher priority.  Return
 			// immediately.
 			rules = []*ResultRule{{
-				FilterListID: int64(nr.GetFilterListID()),
+				FilterListID: nr.GetFilterListID(),
 				Text:         nr.RuleText,
 			}}
 			dnsrr = &DNSRewriteResult{
@@ -60,16 +61,36 @@ func (d *DNSFilter) processDNSRewrites(dnsr []*rules.NetworkRule) (res Result) {
 			}
 
 			return Result{
-				Reason:           RewrittenRule,
-				Rules:            rules,
 				DNSRewriteResult: dnsrr,
+				Rules:            rules,
+				Reason:           RewrittenRule,
 			}
 		}
 	}
 
 	return Result{
-		Reason:           RewrittenRule,
-		Rules:            rules,
 		DNSRewriteResult: dnsrr,
+		Rules:            rules,
+		Reason:           RewrittenRule,
 	}
+}
+
+// processDNSResultRewrites returns an empty Result if there are no dnsrewrite
+// rules in dnsres.  Otherwise, it returns the processed Result.
+func (d *DNSFilter) processDNSResultRewrites(
+	dnsres *urlfilter.DNSResult,
+	host string,
+) (dnsRWRes Result) {
+	dnsr := dnsres.DNSRewrites()
+	if len(dnsr) == 0 {
+		return Result{}
+	}
+
+	res := d.processDNSRewrites(dnsr)
+	if res.Reason == RewrittenRule && res.CanonName == host {
+		// A rewrite of a host to itself.  Go on and try matching other things.
+		return Result{}
+	}
+
+	return res
 }

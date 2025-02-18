@@ -1,13 +1,14 @@
 //go:build windows
-// +build windows
 
 package aghos
 
 import (
+	"os"
+
 	"golang.org/x/sys/windows"
 )
 
-func setRlimit(val uint64) (err error) {
+func setRlimit(_ uint64) (err error) {
 	return Unsupported("setrlimit")
 }
 
@@ -34,4 +35,8 @@ func haveAdminRights() (bool, error) {
 
 func isOpenWrt() (ok bool) {
 	return false
+}
+
+func sendShutdownSignal(c chan<- os.Signal) {
+	c <- os.Interrupt
 }

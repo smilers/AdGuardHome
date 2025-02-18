@@ -1,5 +1,4 @@
-//go:build openbsd || freebsd || linux || darwin
-// +build openbsd freebsd linux darwin
+//go:build darwin || freebsd || linux || openbsd
 
 package aghnet
 
@@ -10,6 +9,7 @@ import (
 	"github.com/AdguardTeam/golibs/errors"
 )
 
+// closePortChecker closes c.  c must be non-nil.
 func closePortChecker(c io.Closer) (err error) {
 	return c.Close()
 }

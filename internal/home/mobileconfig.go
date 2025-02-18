@@ -10,8 +10,10 @@ import (
 
 	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/httphdr"
 	"github.com/AdguardTeam/golibs/log"
-	uuid "github.com/satori/go.uuid"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
+	"github.com/google/uuid"
 	"howett.net/plist"
 )
 
@@ -47,9 +49,9 @@ type payloadContent struct {
 
 	PayloadType        string
 	PayloadIdentifier  string
-	PayloadUUID        string
 	PayloadDisplayName string
 	PayloadDescription string
+	PayloadUUID        uuid.UUID
 	PayloadVersion     int
 }
 
@@ -63,16 +65,12 @@ const dnsSettingsPayloadType = "com.apple.dnsSettings.managed"
 type mobileConfig struct {
 	PayloadDescription       string
 	PayloadDisplayName       string
-	PayloadIdentifier        string
 	PayloadType              string
-	PayloadUUID              string
 	PayloadContent           []*payloadContent
+	PayloadIdentifier        uuid.UUID
+	PayloadUUID              uuid.UUID
 	PayloadVersion           int
 	PayloadRemovalDisallowed bool
-}
-
-func genUUIDv4() string {
-	return uuid.NewV4().String()
 }
 
 const (
@@ -86,7 +84,7 @@ func encodeMobileConfig(d *dnsSettings, clientID string) ([]byte, error) {
 	case dnsProtoHTTPS:
 		dspName = fmt.Sprintf("%s DoH", d.ServerName)
 		u := &url.URL{
-			Scheme: schemeHTTPS,
+			Scheme: urlutil.SchemeHTTPS,
 			Host:   d.ServerName,
 			Path:   path.Join("/dns-query", clientID),
 		}
@@ -104,23 +102,23 @@ func encodeMobileConfig(d *dnsSettings, clientID string) ([]byte, error) {
 		return nil, fmt.Errorf("bad dns protocol %q", proto)
 	}
 
-	payloadID := fmt.Sprintf("%s.%s", dnsSettingsPayloadType, genUUIDv4())
+	payloadID := fmt.Sprintf("%s.%s", dnsSettingsPayloadType, uuid.New())
 	data := &mobileConfig{
-		PayloadDescription: "Adds AdGuard Home to macOS Big Sur " +
-			"and iOS 14 or newer systems",
+		PayloadDescription: "Adds AdGuard Home to macOS Big Sur and iOS 14 or newer systems",
 		PayloadDisplayName: dspName,
-		PayloadIdentifier:  genUUIDv4(),
 		PayloadType:        "Configuration",
-		PayloadUUID:        genUUIDv4(),
 		PayloadContent: []*payloadContent{{
+			DNSSettings: d,
+
 			PayloadType:        dnsSettingsPayloadType,
 			PayloadIdentifier:  payloadID,
-			PayloadUUID:        genUUIDv4(),
 			PayloadDisplayName: dspName,
 			PayloadDescription: "Configures device to use AdGuard Home",
+			PayloadUUID:        uuid.New(),
 			PayloadVersion:     1,
-			DNSSettings:        d,
 		}},
+		PayloadIdentifier:        uuid.New(),
+		PayloadUUID:              uuid.New(),
 		PayloadVersion:           1,
 		PayloadRemovalDisallowed: false,
 	}
@@ -173,7 +171,7 @@ func handleMobileConfig(w http.ResponseWriter, r *http.Request, dnsp string) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set(httphdr.ContentType, "application/xml")
 
 	const (
 		dohContDisp = `attachment; filename=doh.mobileconfig`
@@ -185,7 +183,7 @@ func handleMobileConfig(w http.ResponseWriter, r *http.Request, dnsp string) {
 		contDisp = dotContDisp
 	}
 
-	w.Header().Set("Content-Disposition", contDisp)
+	w.Header().Set(httphdr.ContentDisposition, contDisp)
 
 	_, _ = w.Write(mobileconfig)
 }

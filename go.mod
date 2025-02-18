@@ -1,42 +1,68 @@
 module github.com/AdguardTeam/AdGuardHome
 
-go 1.16
+go 1.23.6
 
 require (
-	github.com/AdguardTeam/dnsproxy v0.39.13
-	github.com/AdguardTeam/golibs v0.10.3
-	github.com/AdguardTeam/urlfilter v0.15.1
+	github.com/AdguardTeam/dnsproxy v0.75.0
+	github.com/AdguardTeam/golibs v0.32.1
+	github.com/AdguardTeam/urlfilter v0.20.0
 	github.com/NYTimes/gziphandler v1.1.1
-	github.com/ameshkov/dnscrypt/v2 v2.2.2
+	github.com/ameshkov/dnscrypt/v2 v2.3.0
+	github.com/bluele/gcache v0.0.2
+	github.com/c2h5oh/datasize v0.0.0-20231215233829-aa82cc1e6500
 	github.com/digineo/go-ipset/v2 v2.2.1
-	github.com/fsnotify/fsnotify v1.4.9
-	github.com/go-ping/ping v0.0.0-20210506233800-ff8be3320020
-	github.com/google/go-cmp v0.5.5
+	github.com/fsnotify/fsnotify v1.8.0
+	// TODO(e.burkov): This package is deprecated; find a new one or use our
+	// own code for that.  Perhaps, use gopacket.
+	github.com/go-ping/ping v1.2.0
+	github.com/google/go-cmp v0.6.0
 	github.com/google/gopacket v1.1.19
-	github.com/google/renameio v1.0.1
-	github.com/insomniacslk/dhcp v0.0.0-20210310193751-cfd4d47082c2
-	github.com/kardianos/service v1.2.0
-	github.com/lucas-clemente/quic-go v0.21.1
-	github.com/mdlayher/ethernet v0.0.0-20190606142754-0394541c37b7
-	github.com/mdlayher/netlink v1.4.0
-	github.com/mdlayher/raw v0.0.0-20210412142147-51b895745faf
-	github.com/miekg/dns v1.1.43
-	github.com/satori/go.uuid v1.2.0
-	github.com/stretchr/testify v1.7.0
-	github.com/ti-mo/netfilter v0.4.0
-	go.etcd.io/bbolt v1.3.6
-	golang.org/x/crypto v0.0.0-20210817164053-32db794688a5
-	golang.org/x/net v0.0.0-20210929193557-e81a3d93ecf6
-	golang.org/x/sys v0.0.0-20210909193231-528a39cd75f3
-	gopkg.in/natefinch/lumberjack.v2 v2.0.0
-	gopkg.in/yaml.v2 v2.4.0
-	howett.net/plist v0.0.0-20201203080718-1454fab16a06
+	github.com/google/renameio/v2 v2.0.0
+	github.com/google/uuid v1.6.0
+	github.com/insomniacslk/dhcp v0.0.0-20250109001534-8abf58130905
+	github.com/josharian/native v1.1.1-0.20230202152459-5c7d0dd6ab86
+	github.com/kardianos/service v1.2.2
+	github.com/mdlayher/ethernet v0.0.0-20220221185849-529eae5b6118
+	github.com/mdlayher/netlink v1.7.2
+	github.com/mdlayher/packet v1.1.2
+	// TODO(a.garipov): This package is deprecated; find a new one or use our
+	// own code for that.  Perhaps, use gopacket.
+	github.com/mdlayher/raw v0.1.0
+	github.com/miekg/dns v1.1.63
+	github.com/quic-go/quic-go v0.49.0
+	github.com/stretchr/testify v1.10.0
+	github.com/ti-mo/netfilter v0.5.2
+	go.etcd.io/bbolt v1.4.0
+	golang.org/x/crypto v0.32.0
+	golang.org/x/exp v0.0.0-20250207012021-f9890c6ad9f3
+	golang.org/x/net v0.34.0
+	golang.org/x/sys v0.30.0
+	gopkg.in/natefinch/lumberjack.v2 v2.2.1
+	gopkg.in/yaml.v3 v3.0.1
+	howett.net/plist v1.0.1
 )
 
-require github.com/stretchr/objx v0.1.1 // indirect
-
-// TODO(e.burkov):  Get rid of the fork in v0.108.0.
-replace github.com/insomniacslk/dhcp => github.com/AdguardTeam/dhcp v0.0.0-20210519141215-51808c73c0bf
-
-// TODO(a.garipov): Return to the main repo once miekg/dns#1317 is merged.
-replace github.com/miekg/dns => github.com/ameshkov/dns v1.1.32-0.20211214123418-7a5e0dc5f1b0
+require (
+	github.com/aead/chacha20 v0.0.0-20180709150244-8b13a72661da // indirect
+	github.com/aead/poly1305 v0.0.0-20180717145839-3fee0db0b635 // indirect
+	github.com/ameshkov/dnsstamps v1.0.3 // indirect
+	github.com/beefsack/go-rate v0.0.0-20220214233405-116f4ca011a0 // indirect
+	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
+	github.com/google/pprof v0.0.0-20250202011525-fc3143867406 // indirect
+	github.com/mdlayher/socket v0.5.1 // indirect
+	github.com/onsi/ginkgo/v2 v2.22.2 // indirect
+	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
+	github.com/pierrec/lz4/v4 v4.1.22 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
+	github.com/pmezard/go-difflib v1.0.0 // indirect
+	github.com/quic-go/qpack v0.5.1 // indirect
+	github.com/robfig/cron/v3 v3.0.1 // indirect
+	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
+	go.uber.org/mock v0.5.0 // indirect
+	golang.org/x/mod v0.23.0 // indirect
+	golang.org/x/sync v0.11.0 // indirect
+	golang.org/x/text v0.22.0 // indirect
+	golang.org/x/tools v0.29.0 // indirect
+	gonum.org/v1/gonum v0.15.1 // indirect
+)

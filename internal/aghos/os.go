@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -19,25 +20,16 @@ import (
 	"github.com/AdguardTeam/golibs/log"
 )
 
-// UnsupportedError is returned by functions and methods when a particular
-// operation Op cannot be performed on the current OS.
-type UnsupportedError struct {
-	Op string
-	OS string
-}
+// Default file, binary, and directory permissions.
+const (
+	DefaultPermDir  fs.FileMode = 0o700
+	DefaultPermExe  fs.FileMode = 0o700
+	DefaultPermFile fs.FileMode = 0o600
+)
 
-// Error implements the error interface for *UnsupportedError.
-func (err *UnsupportedError) Error() (msg string) {
-	return fmt.Sprintf("%s is unsupported on %s", err.Op, err.OS)
-}
-
-// Unsupported is a helper that returns an *UnsupportedError with the Op field
-// set to op and the OS field set to the current OS.
+// Unsupported is a helper that returns a wrapped [errors.ErrUnsupported].
 func Unsupported(op string) (err error) {
-	return &UnsupportedError{
-		Op: op,
-		OS: runtime.GOOS,
-	}
+	return fmt.Errorf("%s: not supported on %s: %w", op, runtime.GOOS, errors.ErrUnsupported)
 }
 
 // SetRlimit sets user-specified limit of how many fd's we can use.
@@ -52,24 +44,26 @@ func HaveAdminRights() (bool, error) {
 	return haveAdminRights()
 }
 
-// MaxCmdOutputSize is the maximum length of performed shell command output.
-const MaxCmdOutputSize = 2 * 1024
+// MaxCmdOutputSize is the maximum length of performed shell command output in
+// bytes.
+const MaxCmdOutputSize = 64 * 1024
 
 // RunCommand runs shell command.
-func RunCommand(command string, arguments ...string) (int, string, error) {
+func RunCommand(command string, arguments ...string) (code int, output []byte, err error) {
 	cmd := exec.Command(command, arguments...)
 	out, err := cmd.Output()
-	if len(out) > MaxCmdOutputSize {
-		out = out[:MaxCmdOutputSize]
+
+	out = out[:min(len(out), MaxCmdOutputSize)]
+
+	if err != nil {
+		if eerr := new(exec.ExitError); errors.As(err, &eerr) {
+			return eerr.ExitCode(), eerr.Stderr, nil
+		}
+
+		return 1, nil, fmt.Errorf("command %q failed: %w: %s", command, err, out)
 	}
 
-	if errors.As(err, new(*exec.ExitError)) {
-		return cmd.ProcessState.ExitCode(), string(out), nil
-	} else if err != nil {
-		return 1, "", fmt.Errorf("exec.Command(%s) failed: %w: %s", command, err, string(out))
-	}
-
-	return cmd.ProcessState.ExitCode(), string(out), nil
+	return cmd.ProcessState.ExitCode(), out, nil
 }
 
 // PIDByCommand searches for process named command and returns its PID ignoring
@@ -118,13 +112,12 @@ func PIDByCommand(command string, except ...int) (pid int, err error) {
 }
 
 // parsePSOutput scans the output of ps searching the largest PID of the process
-// associated with cmdName ignoring PIDs from ignore.  A valid line from
-// r should look like these:
+// associated with cmdName ignoring PIDs from ignore.  A valid line from r
+// should look like these:
 //
-//    123 ./example-cmd
-//   1230 some/base/path/example-cmd
-//   3210 example-cmd
-//
+//	 123 ./example-cmd
+//	1230 some/base/path/example-cmd
+//	3210 example-cmd
 func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum int, err error) {
 	s := bufio.NewScanner(r)
 	for s.Scan() {
@@ -134,14 +127,12 @@ func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum 
 		}
 
 		cur, aerr := strconv.Atoi(fields[0])
-		if aerr != nil || cur < 0 || intIn(cur, ignore) {
+		if aerr != nil || cur < 0 || slices.Contains(ignore, cur) {
 			continue
 		}
 
 		instNum++
-		if cur > largest {
-			largest = cur
-		}
+		largest = max(largest, cur)
 	}
 	if err = s.Err(); err != nil {
 		return 0, 0, fmt.Errorf("scanning stdout: %w", err)
@@ -150,25 +141,12 @@ func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum 
 	return largest, instNum, nil
 }
 
-// intIn returns true if nums contains n.
-func intIn(n int, nums []int) (ok bool) {
-	for _, nn := range nums {
-		if n == nn {
-			return true
-		}
-	}
-
-	return false
-}
-
 // IsOpenWrt returns true if host OS is OpenWrt.
 func IsOpenWrt() (ok bool) {
 	return isOpenWrt()
 }
 
-// RootDirFS returns the fs.FS rooted at the operating system's root.
-func RootDirFS() (fsys fs.FS) {
-	// Use empty string since os.DirFS implicitly prepends a slash to it.  This
-	// behavior is undocumented but it currently works.
-	return os.DirFS("")
+// SendShutdownSignal sends the shutdown signal to the channel.
+func SendShutdownSignal(c chan<- os.Signal) {
+	sendShutdownSignal(c)
 }

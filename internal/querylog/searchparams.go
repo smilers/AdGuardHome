@@ -1,19 +1,30 @@
 package querylog
 
-import "time"
+import (
+	"context"
+	"log/slog"
+	"time"
+)
 
-// searchParams represent the search query sent by the client
+// searchParams represent the search query sent by the client.
 type searchParams struct {
-	// searchCriteria - list of search criteria that we use to get filter results
-	searchCriteria []searchCriterion
-
-	// olderThen - return entries that are older than this value
-	// if not set - disregard it and return any value
+	// olderThen represents a parameter for entries that are older than this
+	// parameter value.  If not set, disregard it and return any value.
 	olderThan time.Time
 
-	offset             int // offset for the search
-	limit              int // limit the number of records returned
-	maxFileScanEntries int // maximum log entries to scan in query log files. if 0 - no limit
+	// searchCriteria is a list of search criteria that we use to get filter
+	// results.
+	searchCriteria []searchCriterion
+
+	// offset for the search.
+	offset int
+
+	// limit the number of records returned.
+	limit int
+
+	// maxFileScanEntries is a maximum of log entries to scan in query log
+	// files.  If not set, then no limit.
+	maxFileScanEntries int
 }
 
 // newSearchParams - creates an empty instance of searchParams
@@ -28,14 +39,23 @@ func newSearchParams() *searchParams {
 }
 
 // quickMatchClientFunc is a simplified client finder for quick matches.
-type quickMatchClientFunc = func(clientID, ip string) (c *Client)
+type quickMatchClientFunc = func(
+	ctx context.Context,
+	logger *slog.Logger,
+	clientID, ip string,
+) (c *Client)
 
 // quickMatch quickly checks if the line matches the given search parameters.
 // It returns false if the line doesn't match.  This method is only here for
-// optimisation purposes.
-func (s *searchParams) quickMatch(line string, findClient quickMatchClientFunc) (ok bool) {
+// optimization purposes.
+func (s *searchParams) quickMatch(
+	ctx context.Context,
+	logger *slog.Logger,
+	line string,
+	findClient quickMatchClientFunc,
+) (ok bool) {
 	for _, c := range s.searchCriteria {
-		if !c.quickMatch(line, findClient) {
+		if !c.quickMatch(ctx, logger, line, findClient) {
 			return false
 		}
 	}

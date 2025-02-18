@@ -1,71 +1,90 @@
-package aghnet
+package aghnet_test
 
 import (
 	"net"
+	"net/netip"
+	"net/url"
 	"testing"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/aghtest"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/golibs/netutil"
+	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 func TestMain(m *testing.M) {
-	aghtest.DiscardLogOutput(m)
+	testutil.DiscardLogOutput(m)
 }
 
-func TestGetValidNetInterfacesForWeb(t *testing.T) {
-	ifaces, err := GetValidNetInterfacesForWeb()
-	require.NoErrorf(t, err, "cannot get net interfaces: %s", err)
-	require.NotEmpty(t, ifaces, "no net interfaces found")
-	for _, iface := range ifaces {
-		require.NotEmptyf(t, iface.Addresses, "no addresses found for %s", iface.Name)
-	}
-}
+func TestParseAddrPort(t *testing.T) {
+	const defaultPort = 1
 
-func TestBroadcastFromIPNet(t *testing.T) {
-	known6 := net.IP{
-		1, 2, 3, 4,
-		5, 6, 7, 8,
-		9, 10, 11, 12,
-		13, 14, 15, 16,
-	}
+	v4addr := netip.MustParseAddr("1.2.3.4")
 
 	testCases := []struct {
-		name   string
-		subnet *net.IPNet
-		want   net.IP
+		name       string
+		input      string
+		wantErrMsg string
+		want       netip.AddrPort
 	}{{
-		name: "full",
-		subnet: &net.IPNet{
-			IP:   net.IP{192, 168, 0, 1},
-			Mask: net.IPMask{255, 255, 15, 0},
-		},
-		want: net.IP{192, 168, 240, 255},
+		name:       "success_ip",
+		input:      v4addr.String(),
+		wantErrMsg: "",
+		want:       netip.AddrPortFrom(v4addr, defaultPort),
 	}, {
-		name: "ipv6_no_mask",
-		subnet: &net.IPNet{
-			IP: known6,
-		},
-		want: known6,
+		name:       "success_ip_port",
+		input:      netutil.JoinHostPort(v4addr.String(), 5),
+		wantErrMsg: "",
+		want:       netip.AddrPortFrom(v4addr, 5),
 	}, {
-		name: "ipv4_no_mask",
-		subnet: &net.IPNet{
-			IP: net.IP{192, 168, 1, 2},
-		},
-		want: net.IP{192, 168, 1, 255},
+		name: "success_url",
+		input: (&url.URL{
+			Scheme: "tcp",
+			Host:   v4addr.String(),
+		}).String(),
+		wantErrMsg: "",
+		want:       netip.AddrPortFrom(v4addr, defaultPort),
 	}, {
-		name: "unspecified",
-		subnet: &net.IPNet{
-			IP:   net.IP{0, 0, 0, 0},
-			Mask: net.IPMask{0, 0, 0, 0},
-		},
-		want: net.IPv4bcast,
+		name: "success_url_port",
+		input: (&url.URL{
+			Scheme: "tcp",
+			Host:   netutil.JoinHostPort(v4addr.String(), 5),
+		}).String(),
+		wantErrMsg: "",
+		want:       netip.AddrPortFrom(v4addr, 5),
+	}, {
+		name:  "error_invalid_ip",
+		input: "256.256.256.256",
+		wantErrMsg: `not an ip:port
+ParseAddr("256.256.256.256"): IPv4 field has value >255`,
+		want: netip.AddrPort{},
+	}, {
+		name:  "error_invalid_port",
+		input: net.JoinHostPort(v4addr.String(), "-5"),
+		wantErrMsg: `invalid port "-5" parsing "1.2.3.4:-5"
+ParseAddr("1.2.3.4:-5"): unexpected character (at ":-5")`,
+		want: netip.AddrPort{},
+	}, {
+		name:  "error_invalid_url",
+		input: "tcp:://1.2.3.4",
+		wantErrMsg: `invalid port "//1.2.3.4" parsing "tcp:://1.2.3.4"
+ParseAddr("tcp:://1.2.3.4"): each colon-separated field must have at least ` +
+			`one digit (at "tcp:://1.2.3.4")`,
+		want: netip.AddrPort{},
+	}, {
+		name:  "empty",
+		input: "",
+		want:  netip.AddrPort{},
+		wantErrMsg: `not an ip:port
+ParseAddr(""): unable to parse IP`,
 	}}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			bc := BroadcastFromIPNet(tc.subnet)
-			assert.True(t, bc.Equal(tc.want), bc)
+			ap, err := aghnet.ParseAddrPort(tc.input, defaultPort)
+			testutil.AssertErrorMsg(t, tc.wantErrMsg, err)
+
+			assert.Equal(t, tc.want, ap)
 		})
 	}
 }
