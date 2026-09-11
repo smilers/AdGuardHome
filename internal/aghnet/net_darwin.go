@@ -1,17 +1,24 @@
 //go:build darwin
-// +build darwin
 
 package aghnet
 
 import (
+	"bufio"
+	"bytes"
+	"context"
 	"fmt"
-	"os"
+	"io"
+	"log/slog"
 	"regexp"
-	"strings"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/ioutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
 )
+
+// networkSetupCmd is the command to configure network settings.
+const networkSetupCmd = "networksetup"
 
 // hardwarePortInfo contains information about the current state of the internet
 // connection obtained from macOS networksetup.
@@ -23,12 +30,14 @@ type hardwarePortInfo struct {
 	static    bool
 }
 
-func canBindPrivilegedPorts() (can bool, err error) {
-	return aghos.HaveAdminRights()
-}
-
-func ifaceHasStaticIP(ifaceName string) (bool, error) {
-	portInfo, err := getCurrentHardwarePortInfo(ifaceName)
+// ifaceHasStaticIP reports whether ifaceName is configured with a static IP.
+// cmdCons must not be nil.
+func ifaceHasStaticIP(
+	ctx context.Context,
+	cmdCons executil.CommandConstructor,
+	ifaceName string,
+) (ok bool, err error) {
+	portInfo, err := getCurrentHardwarePortInfo(ctx, cmdCons, ifaceName)
 	if err != nil {
 		return false, err
 	}
@@ -36,84 +45,111 @@ func ifaceHasStaticIP(ifaceName string) (bool, error) {
 	return portInfo.static, nil
 }
 
-// getCurrentHardwarePortInfo gets information for the specified network interface.
-func getCurrentHardwarePortInfo(ifaceName string) (hardwarePortInfo, error) {
-	// First of all we should find hardware port name
-	m := getNetworkSetupHardwareReports()
+// getCurrentHardwarePortInfo returns information for the specified network
+// interface.  cmdCons must not be nil.
+func getCurrentHardwarePortInfo(
+	ctx context.Context,
+	cmdCons executil.CommandConstructor,
+	ifaceName string,
+) (hardwarePortInfo, error) {
+	// First, find the hardware port name.
+	m := getNetworkSetupHardwareReports(ctx, cmdCons)
 	hardwarePort, ok := m[ifaceName]
 	if !ok {
 		return hardwarePortInfo{}, fmt.Errorf("could not find hardware port for %s", ifaceName)
 	}
 
-	return getHardwarePortInfo(hardwarePort)
+	return getHardwarePortInfo(ctx, cmdCons, hardwarePort)
 }
 
-// getNetworkSetupHardwareReports parses the output of the `networksetup
-// -listallhardwareports` command it returns a map where the key is the
-// interface name, and the value is the "hardware port" returns nil if it fails
-// to parse the output
+// hardwareReportsReg is the regular expression matching the lines of
+// networksetup command output lines containing the interface information.
+var hardwareReportsReg = regexp.MustCompile("Hardware Port: (.*?)\nDevice: (.*?)\n")
+
+// getNetworkSetupHardwareReports returns a map of interface names to hardware
+// port names.  It returns nil if parsing fails.  cmdCons must not be nil.
 //
 // TODO(e.burkov):  There should be more proper approach than parsing the
 // command output.  For example, see
 // https://developer.apple.com/documentation/systemconfiguration.
-func getNetworkSetupHardwareReports() map[string]string {
-	_, out, err := aghos.RunCommand("networksetup", "-listallhardwareports")
+func getNetworkSetupHardwareReports(
+	ctx context.Context,
+	cmdCons executil.CommandConstructor,
+) (reports map[string]string) {
+	stdout := bytes.Buffer{}
+	stderr := bytes.Buffer{}
+	err := executil.Run(ctx, cmdCons, &executil.CommandConfig{
+		Stderr: &stderr,
+		Stdout: ioutil.NewTruncatedWriter(&stdout, aghos.MaxCmdOutputSize),
+		Path:   networkSetupCmd,
+		Args:   []string{"-listallhardwareports"},
+	})
 	if err != nil {
 		return nil
 	}
 
-	re, err := regexp.Compile("Hardware Port: (.*?)\nDevice: (.*?)\n")
-	if err != nil {
-		return nil
+	reports = make(map[string]string)
+
+	matches := hardwareReportsReg.FindAllSubmatch(stdout.Bytes(), -1)
+	for _, m := range matches {
+		reports[string(m[2])] = string(m[1])
 	}
 
-	m := make(map[string]string)
-
-	matches := re.FindAllStringSubmatch(out, -1)
-	for i := range matches {
-		port := matches[i][1]
-		device := matches[i][2]
-		m[device] = port
-	}
-
-	return m
+	return reports
 }
 
-func getHardwarePortInfo(hardwarePort string) (hardwarePortInfo, error) {
-	h := hardwarePortInfo{}
+// hardwarePortReg is the regular expression matching the lines of networksetup
+// command output lines containing the port information.
+var hardwarePortReg = regexp.MustCompile("IP address: (.*?)\nSubnet mask: (.*?)\nRouter: (.*?)\n")
 
-	_, out, err := aghos.RunCommand("networksetup", "-getinfo", hardwarePort)
+// getHardwarePortInfo returns IP, subnet, gateway, and static/dynamic status
+// for the given hardware port.  cmdCons must not be nil.
+func getHardwarePortInfo(
+	ctx context.Context,
+	cmdCons executil.CommandConstructor,
+	hardwarePort string,
+) (h hardwarePortInfo, err error) {
+	stdout := bytes.Buffer{}
+	stderr := bytes.Buffer{}
+	err = executil.Run(ctx, cmdCons, &executil.CommandConfig{
+		Stderr: &stderr,
+		Stdout: ioutil.NewTruncatedWriter(&stdout, aghos.MaxCmdOutputSize),
+		Path:   networkSetupCmd,
+		Args:   []string{"-getinfo", hardwarePort},
+	})
 	if err != nil {
 		return h, err
 	}
 
-	re := regexp.MustCompile("IP address: (.*?)\nSubnet mask: (.*?)\nRouter: (.*?)\n")
-
-	match := re.FindStringSubmatch(out)
-	if len(match) == 0 {
+	out := stdout.Bytes()
+	match := hardwarePortReg.FindSubmatch(out)
+	if len(match) != 4 {
 		return h, errors.Error("could not find hardware port info")
 	}
 
-	h.name = hardwarePort
-	h.ip = match[1]
-	h.subnet = match[2]
-	h.gatewayIP = match[3]
-
-	if strings.Index(out, "Manual Configuration") == 0 {
-		h.static = true
-	}
-
-	return h, nil
+	return hardwarePortInfo{
+		name:      hardwarePort,
+		ip:        string(match[1]),
+		subnet:    string(match[2]),
+		gatewayIP: string(match[3]),
+		static:    bytes.Index(out, []byte("Manual Configuration")) == 0,
+	}, nil
 }
 
-func ifaceSetStaticIP(ifaceName string) (err error) {
-	portInfo, err := getCurrentHardwarePortInfo(ifaceName)
+// ifaceSetStaticIP sets a static IP on ifaceName.  cmdCons must not be nil.
+func ifaceSetStaticIP(
+	ctx context.Context,
+	_ *slog.Logger,
+	cmdCons executil.CommandConstructor,
+	ifaceName string,
+) (err error) {
+	portInfo, err := getCurrentHardwarePortInfo(ctx, cmdCons, ifaceName)
 	if err != nil {
 		return err
 	}
 
 	if portInfo.static {
-		return errors.Error("IP address is already static")
+		return errors.Error("ip address is already static")
 	}
 
 	dnsAddrs, err := getEtcResolvConfServers()
@@ -121,50 +157,61 @@ func ifaceSetStaticIP(ifaceName string) (err error) {
 		return err
 	}
 
-	args := make([]string, 0)
-	args = append(args, "-setdnsservers", portInfo.name)
-	args = append(args, dnsAddrs...)
+	args := append([]string{"-setdnsservers", portInfo.name}, dnsAddrs...)
 
-	// Setting DNS servers is necessary when configuring a static IP
-	code, _, err := aghos.RunCommand("networksetup", args...)
+	// Setting DNS servers is necessary when configuring a static IP.
+	err = executil.RunWithPeek(ctx, cmdCons, aghos.MaxCmdOutputSize, networkSetupCmd, args...)
 	if err != nil {
-		return err
-	}
-	if code != 0 {
-		return fmt.Errorf("failed to set DNS servers, code=%d", code)
+		return fmt.Errorf("networksetup failed to set dns servers: %w", err)
 	}
 
-	// Actually configures hardware port to have static IP
-	code, _, err = aghos.RunCommand("networksetup", "-setmanual",
-		portInfo.name, portInfo.ip, portInfo.subnet, portInfo.gatewayIP)
+	// Actually configures hardware port to have static IP.
+	err = executil.RunWithPeek(
+		ctx,
+		cmdCons,
+		aghos.MaxCmdOutputSize,
+		networkSetupCmd,
+		"-setmanual",
+		portInfo.name,
+		portInfo.ip,
+		portInfo.subnet,
+		portInfo.gatewayIP,
+	)
 	if err != nil {
-		return err
-	}
-	if code != 0 {
-		return fmt.Errorf("failed to set DNS servers, code=%d", code)
+		return fmt.Errorf("networksetup failed to configure dns servers: %w", err)
 	}
 
 	return nil
 }
 
+// etcResolvConfReg is the regular expression matching the lines of resolv.conf
+// file containing a name server information.
+var etcResolvConfReg = regexp.MustCompile("nameserver ([a-zA-Z0-9.:]+)")
+
 // getEtcResolvConfServers returns a list of nameservers configured in
 // /etc/resolv.conf.
-func getEtcResolvConfServers() ([]string, error) {
-	body, err := os.ReadFile("/etc/resolv.conf")
+func getEtcResolvConfServers() (addrs []string, err error) {
+	const filename = "etc/resolv.conf"
+
+	_, err = aghos.FileWalker(func(r io.Reader) (_ []string, _ bool, err error) {
+		sc := bufio.NewScanner(r)
+		for sc.Scan() {
+			matches := etcResolvConfReg.FindAllStringSubmatch(sc.Text(), -1)
+			if len(matches) == 0 {
+				continue
+			}
+
+			for _, m := range matches {
+				addrs = append(addrs, m[1])
+			}
+		}
+
+		return nil, false, sc.Err()
+	}).Walk(rootDirFS, filename)
 	if err != nil {
-		return nil, err
-	}
-
-	re := regexp.MustCompile("nameserver ([a-zA-Z0-9.:]+)")
-
-	matches := re.FindAllStringSubmatch(string(body), -1)
-	if len(matches) == 0 {
-		return nil, errors.Error("found no DNS servers in /etc/resolv.conf")
-	}
-
-	addrs := make([]string, 0)
-	for i := range matches {
-		addrs = append(addrs, matches[i][1])
+		return nil, fmt.Errorf("parsing etc/resolv.conf file: %w", err)
+	} else if len(addrs) == 0 {
+		return nil, fmt.Errorf("found no dns servers in %s", filename)
 	}
 
 	return addrs, nil

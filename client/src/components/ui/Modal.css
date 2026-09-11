@@ -11,6 +11,7 @@
 .ReactModal__Overlay--after-open {
     opacity: 1;
     transition: opacity 150ms ease-out;
+    background-color: var(--modal-overlay-bgcolor) !important;
 }
 
 .ReactModal__Content {
@@ -40,7 +41,8 @@
 }
 
 @media (min-width: 576px) {
-    .modal-dialog--clients {
+    .modal-dialog--clients,
+    .modal-dialog--schedule {
         max-width: 650px;
     }
 }

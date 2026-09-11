@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package aghos
 
@@ -8,6 +7,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/AdguardTeam/golibs/osutil"
 	"github.com/AdguardTeam/golibs/stringutil"
 )
 
@@ -41,7 +41,7 @@ func isOpenWrt() (ok bool) {
 		}
 
 		return nil, !stringutil.ContainsFold(string(data), osNameData), nil
-	}).Walk(RootDirFS(), etcReleasePattern)
+	}).Walk(osutil.RootDirFS(), etcReleasePattern)
 
 	return err == nil && ok
 }

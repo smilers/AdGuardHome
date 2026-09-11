@@ -1,28 +1,30 @@
 //go:build freebsd
-// +build freebsd
 
 package aghnet
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
 	"strings"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
+	"github.com/AdguardTeam/golibs/netutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
 )
 
-func canBindPrivilegedPorts() (can bool, err error) {
-	return aghos.HaveAdminRights()
-}
-
-func ifaceHasStaticIP(ifaceName string) (ok bool, err error) {
+func ifaceHasStaticIP(
+	_ context.Context,
+	_ executil.CommandConstructor,
+	ifaceName string,
+) (ok bool, err error) {
 	const rcConfFilename = "etc/rc.conf"
 
 	walker := aghos.FileWalker(interfaceName(ifaceName).rcConfStaticConfig)
 
-	return walker.Walk(aghos.RootDirFS(), rcConfFilename)
+	return walker.Walk(rootDirFS, rcConfFilename)
 }
 
 // rcConfStaticConfig checks if the interface is configured by /etc/rc.conf to
@@ -43,9 +45,13 @@ func (n interfaceName) rcConfStaticConfig(r io.Reader) (_ []string, cont bool, e
 		// TODO(e.burkov):  Expand the check to cover possible
 		// configurations from man rc.conf(5).
 		fields := strings.Fields(line[cfgLeft:cfgRight])
-		if len(fields) >= 2 &&
-			strings.EqualFold(fields[0], "inet") &&
-			net.ParseIP(fields[1]) != nil {
+		switch {
+		case
+			len(fields) < 2,
+			!strings.EqualFold(fields[0], "inet"),
+			!netutil.IsValidIPString(fields[1]):
+			continue
+		default:
 			return nil, false, s.Err()
 		}
 	}
@@ -53,6 +59,11 @@ func (n interfaceName) rcConfStaticConfig(r io.Reader) (_ []string, cont bool, e
 	return nil, true, s.Err()
 }
 
-func ifaceSetStaticIP(string) (err error) {
+func ifaceSetStaticIP(
+	_ context.Context,
+	_ *slog.Logger,
+	_ executil.CommandConstructor,
+	_ string,
+) (err error) {
 	return aghos.Unsupported("setting static ip")
 }

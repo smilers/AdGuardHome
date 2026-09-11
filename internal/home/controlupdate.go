@@ -3,19 +3,23 @@ package home
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghtls"
 	"github.com/AdguardTeam/AdGuardHome/internal/updater"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/osutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
 )
 
 // temporaryError is the interface for temporary errors from the Go standard
@@ -25,14 +29,18 @@ type temporaryError interface {
 	Temporary() (ok bool)
 }
 
-// Get the latest available version from the Internet
-func handleGetVersionJSON(w http.ResponseWriter, r *http.Request) {
+// handleVersionJSON is the handler for the POST /control/version.json HTTP API.
+//
+// TODO(a.garipov): Find out if this API used with a GET method by anyone.
+func (web *webAPI) handleVersionJSON(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := web.logger
+
 	resp := &versionResponse{}
-	if Context.disableUpdate {
-		// w.Header().Set("Content-Type", "application/json")
+	if web.conf.disableUpdate {
 		resp.Disabled = true
-		_ = json.NewEncoder(w).Encode(resp)
-		// TODO(e.burkov): Add error handling and deal with headers.
+		aghhttp.WriteJSONResponseOK(ctx, l, w, r, resp)
+
 		return
 	}
 
@@ -44,162 +52,232 @@ func handleGetVersionJSON(w http.ResponseWriter, r *http.Request) {
 	if r.ContentLength != 0 {
 		err = json.NewDecoder(r.Body).Decode(req)
 		if err != nil {
-			aghhttp.Error(r, w, http.StatusBadRequest, "JSON parse: %s", err)
+			aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "parsing request: %s", err)
 
 			return
 		}
 	}
 
-	for i := 0; i != 3; i++ {
-		func() {
-			Context.controlLock.Lock()
-			defer Context.controlLock.Unlock()
+	err = web.requestVersionInfo(ctx, resp, req.Recheck)
+	if err != nil {
+		// Don't wrap the error, because it's informative enough as is.
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadGateway, "%s", err)
 
-			resp.VersionInfo, err = Context.updater.VersionInfo(req.Recheck)
-		}()
+		return
+	}
 
-		if err != nil {
-			var terr temporaryError
-			if errors.As(err, &terr) && terr.Temporary() {
-				// Temporary network error.  This case may happen while
-				// we're restarting our DNS server.  Log and sleep for
-				// some time.
-				//
-				// See https://github.com/AdguardTeam/AdGuardHome/issues/934.
-				d := time.Duration(i) * time.Second
-				log.Info("temp net error: %q; sleeping for %s and retrying", err, d)
-				time.Sleep(d)
+	extTLSConf := web.tlsManager.ExtendedTLSConfig()
+	err = resp.setAllowedToAutoUpdate(ctx, l, extTLSConf)
+	if err != nil {
+		// Don't wrap the error, because it's informative enough as is.
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusInternalServerError, "%s", err)
 
-				continue
-			}
+		return
+	}
+
+	aghhttp.WriteJSONResponseOK(ctx, l, w, r, resp)
+}
+
+// requestVersionInfo sets the VersionInfo field of resp if it can reach the
+// update server.  resp must not be nil.
+func (web *webAPI) requestVersionInfo(
+	ctx context.Context,
+	resp *versionResponse,
+	recheck bool,
+) (err error) {
+	updater := web.conf.updater
+	for range 3 {
+		resp.VersionInfo, err = updater.VersionInfo(ctx, recheck)
+		if err == nil {
+			return nil
+		}
+
+		if tmpErr, ok := errors.AsType[temporaryError](err); ok && tmpErr.Temporary() {
+			// Temporary network error.  This case may happen while we're
+			// restarting our DNS server.  Log and sleep for some time.
+			//
+			// See https://github.com/AdguardTeam/AdGuardHome/issues/934.
+			const sleepTime = 2 * time.Second
+
+			err = fmt.Errorf("temp net error: %w; sleeping for %s and retrying", err, sleepTime)
+			web.logger.InfoContext(ctx, "updating version info", slogutil.KeyError, err)
+
+			time.Sleep(sleepTime)
+
+			continue
 		}
 
 		break
 	}
+
 	if err != nil {
-		vcu := Context.updater.VersionCheckURL()
-		// TODO(a.garipov): Figure out the purpose of %T verb.
-		aghhttp.Error(
+		web.logger.WarnContext(ctx, "getting version info", slogutil.KeyError, err)
+
+		return fmt.Errorf("getting version info: %w", err)
+	}
+
+	return nil
+}
+
+// handleUpdate performs an update to the latest available version procedure.
+func (web *webAPI) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := web.logger
+
+	updater := web.conf.updater
+	if updater.NewVersion() == "" {
+		aghhttp.ErrorAndLog(
+			ctx,
+			l,
 			r,
 			w,
-			http.StatusBadGateway,
-			"Couldn't get version check json from %s: %T %s\n",
-			vcu,
-			err,
-			err,
+			http.StatusBadRequest,
+			"update request isn't allowed now",
 		)
 
 		return
 	}
 
-	resp.confirmAutoUpdate()
-
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(resp)
+	// Retain the current absolute path of the executable, since the updater is
+	// likely to change the position current one to the backup directory.
+	//
+	// See https://github.com/AdguardTeam/AdGuardHome/issues/4735.
+	execPath, err := os.Executable()
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "Couldn't write body: %s", err)
-	}
-}
-
-// handleUpdate performs an update to the latest available version procedure.
-func handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if Context.updater.NewVersion() == "" {
-		aghhttp.Error(r, w, http.StatusBadRequest, "/update request isn't allowed now")
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusInternalServerError, "getting path: %s", err)
 
 		return
 	}
 
-	err := Context.updater.Update()
+	err = updater.Update(ctx, false)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "%s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusInternalServerError, "%s", err)
 
 		return
 	}
 
-	aghhttp.OK(w)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
+	aghhttp.OK(ctx, web.logger, w)
+
+	rc := http.NewResponseController(w)
+	err = rc.Flush()
+	if err != nil {
+		web.logger.WarnContext(ctx, "flushing response", slogutil.KeyError, err)
 	}
 
-	// The background context is used because the underlying functions wrap
-	// it with timeout and shut down the server, which handles current
-	// request. It also should be done in a separate goroutine due to the
-	// same reason.
-	go func() {
-		finishUpdate(context.Background())
-	}()
+	// The background context is used because the underlying functions wrap it
+	// with timeout and shut down the server, which handles current request.  It
+	// also should be done in a separate goroutine for the same reason.
+	go web.finishUpdate(context.Background(), execPath)
 }
 
 // versionResponse is the response for /control/version.json endpoint.
 type versionResponse struct {
-	Disabled bool `json:"disabled"`
 	updater.VersionInfo
+	Disabled bool `json:"disabled"`
 }
 
-// confirmAutoUpdate checks the real possibility of auto update.
-func (vr *versionResponse) confirmAutoUpdate() {
-	if vr.CanAutoUpdate != nil && *vr.CanAutoUpdate {
-		canUpdate := true
+// maxPrivilegedPort is the maximum port number.  This only applies to Unix, as
+// on Windows, [aghnet.CanBindPrivilegedPorts] always returns `true`, `nil`.
+const maxPrivilegedPort = 1024
 
-		var tlsConf *tlsConfigSettings
-		if runtime.GOOS != "windows" {
-			tlsConf = &tlsConfigSettings{}
-			Context.tls.WriteDiskConfig(tlsConf)
-		}
-
-		if tlsConf != nil &&
-			((tlsConf.Enabled && (tlsConf.PortHTTPS < 1024 ||
-				tlsConf.PortDNSOverTLS < 1024 ||
-				tlsConf.PortDNSOverQUIC < 1024)) ||
-				config.BindPort < 1024 ||
-				config.DNS.Port < 1024) {
-			canUpdate, _ = aghnet.CanBindPrivilegedPorts()
-		}
-		vr.CanAutoUpdate = &canUpdate
+// setAllowedToAutoUpdate sets CanAutoUpdate to true if AdGuard Home is actually
+// allowed to perform an automatic update by the OS.  l and extTLSConf must not
+// be nil.
+func (vr *versionResponse) setAllowedToAutoUpdate(
+	ctx context.Context,
+	l *slog.Logger,
+	extTLSConf *aghtls.ExtendedTLSConfig,
+) (err error) {
+	if vr.CanAutoUpdate != aghalg.NBTrue {
+		return nil
 	}
-}
 
-// finishUpdate completes an update procedure.
-func finishUpdate(ctx context.Context) {
-	log.Info("Stopping all tasks")
-	cleanup(ctx)
-	cleanupAlways()
-
-	exeName := "AdGuardHome"
-	if runtime.GOOS == "windows" {
-		exeName = "AdGuardHome.exe"
-	}
-	curBinName := filepath.Join(Context.workDir, exeName)
-
-	if runtime.GOOS == "windows" {
-		if Context.runningAsService {
-			// Note:
-			// we can't restart the service via "kardianos/service" package - it kills the process first
-			// we can't start a new instance - Windows doesn't allow it
-			cmd := exec.Command("cmd", "/c", "net stop AdGuardHome & net start AdGuardHome")
-			err := cmd.Start()
-			if err != nil {
-				log.Fatalf("exec.Command() failed: %s", err)
-			}
-			os.Exit(0)
-		}
-
-		cmd := exec.Command(curBinName, os.Args[1:]...)
-		log.Info("Restarting: %v", cmd.Args)
-		cmd.Stdin = os.Stdin
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		err := cmd.Start()
+	canUpdate := true
+	if extTLSConf.UsesPrivilegedPorts(maxPrivilegedPort) ||
+		config.HTTPConfig.Address.Port() < maxPrivilegedPort ||
+		config.DNS.Port < maxPrivilegedPort {
+		canUpdate, err = aghnet.CanBindPrivilegedPorts(ctx, l)
 		if err != nil {
-			log.Fatalf("exec.Command() failed: %s", err)
+			return fmt.Errorf("checking ability to bind privileged ports: %w", err)
 		}
-		os.Exit(0)
+	}
+
+	vr.CanAutoUpdate = aghalg.BoolToNullBool(canUpdate)
+
+	return nil
+}
+
+// finishUpdate completes an update procedure.  It is intended to be used as a
+// goroutine.
+func (web *webAPI) finishUpdate(
+	ctx context.Context,
+	execPath string,
+) {
+	defer slogutil.RecoverAndExit(ctx, web.logger, osutil.ExitCodeFailure)
+
+	web.logger.InfoContext(ctx, "stopping all tasks")
+
+	// Ignore the error because, according to the documentation, this method
+	//  always returns nil error.
+	err := web.Shutdown(ctx)
+	if err != nil {
+		// Should never happen.
+		web.logger.WarnContext(ctx, "shutting down web", slogutil.KeyError, err)
+	}
+
+	cleanup(ctx, web.logger, web.hostsContainer)
+	cleanupAlways(ctx, web.logger, web.pidFilePath)
+
+	if runtime.GOOS == "windows" {
+		web.finalizeWindowsUpdate(ctx, execPath)
+
+		os.Exit(osutil.ExitCodeSuccess)
+	}
+
+	web.logger.InfoContext(ctx, "restarting", "exec_path", execPath, "args", os.Args[1:])
+	err = syscall.Exec(execPath, os.Args, os.Environ())
+	if err != nil {
+		panic(fmt.Errorf("restarting: %w", err))
+	}
+}
+
+// finalizeWindowsUpdate completes an update procedure on windows.
+func (web *webAPI) finalizeWindowsUpdate(
+	ctx context.Context,
+	execPath string,
+) {
+	var commandConf *executil.CommandConfig
+
+	if web.conf.runningAsService {
+		// NOTE: We can't restart the service via "kardianos/service" package,
+		// because it kills the process first we can't start a new instance,
+		// because Windows doesn't allow it.
+		//
+		// TODO(a.garipov): Recheck the claim above.
+		commandConf = &executil.CommandConfig{
+			Path: "cmd",
+			Args: []string{"/c", "net stop AdGuardHome & net start AdGuardHome"},
+		}
 	} else {
-		log.Info("Restarting: %v", os.Args)
-		err := syscall.Exec(curBinName, os.Args, os.Environ())
-		if err != nil {
-			log.Fatalf("syscall.Exec() failed: %s", err)
+		commandConf = &executil.CommandConfig{
+			Path:   execPath,
+			Args:   os.Args[1:],
+			Stdin:  os.Stdin,
+			Stdout: os.Stdout,
+			Stderr: os.Stderr,
 		}
-		// Unreachable code
+	}
+
+	web.logger.InfoContext(ctx, "restarting", "exec_path", execPath, "args", os.Args[1:])
+
+	var cmd executil.Command
+	cmd, err := web.cmdCons.New(ctx, commandConf)
+	if err != nil {
+		panic(fmt.Errorf("constructing cmd: %w", err))
+	}
+
+	err = cmd.Start(ctx)
+	if err != nil {
+		panic(fmt.Errorf("restarting: %w", err))
 	}
 }

@@ -1,7 +1,6 @@
 .icons {
     display: inline-block;
     vertical-align: middle;
-    height: 100%;
 }
 
 .icon--24 {
@@ -20,6 +19,13 @@
 
 .icon--18 {
     --size: 1.125rem;
+
+    width: var(--size);
+    height: var(--size);
+}
+
+.icon--15 {
+    --size: 0.95rem;
 
     width: var(--size);
     height: var(--size);

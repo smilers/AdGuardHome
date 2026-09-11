@@ -1,10 +1,12 @@
-package filtering
+package filtering_test
 
 import (
-	"net"
+	"net/netip"
 	"path"
 	"testing"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,12 +17,12 @@ func TestDNSFilter_CheckHostRules_dnsrewrite(t *testing.T) {
 |cname^$dnsrewrite=new-cname
 
 |a-record^$dnsrewrite=127.0.0.1
-
 |aaaa-record^$dnsrewrite=::1
 
 |txt-record^$dnsrewrite=NOERROR;TXT;hello-world
-
 |refused^$dnsrewrite=REFUSED
+
+|mapped^$dnsrewrite=NOERROR;AAAA;::ffff:127.0.0.1
 
 |a-records^$dnsrewrite=127.0.0.1
 |a-records^$dnsrewrite=127.0.0.2
@@ -49,34 +51,45 @@ func TestDNSFilter_CheckHostRules_dnsrewrite(t *testing.T) {
 |1.2.3.5.in-addr.arpa^$dnsrewrite=NOERROR;PTR;new-ptr-with-dot.
 `
 
-	f := newForTest(t, nil, []Filter{{ID: 0, Data: []byte(text)}})
-	setts := &Settings{
+	conf := &filtering.Config{
+		Logger:                testLogger,
+		SafeBrowsingCacheSize: 10000,
+		ParentalCacheSize:     10000,
+		SafeSearchCacheSize:   1000,
+		CacheTime:             30,
+	}
+
+	f, err := filtering.New(conf, []filtering.Filter{{ID: 0, Data: []byte(text)}})
+	require.NoError(t, err)
+
+	setts := &filtering.Settings{
 		FilteringEnabled: true,
 	}
 
-	ipv4p1 := net.IPv4(127, 0, 0, 1)
-	ipv4p2 := net.IPv4(127, 0, 0, 2)
-	ipv6p1 := net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}
-	ipv6p2 := net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2}
+	ipv4p1 := netutil.IPv4Localhost()
+	ipv4p2 := ipv4p1.Next()
+	ipv6p1 := netutil.IPv6Localhost()
+	ipv6p2 := ipv6p1.Next()
+	mapped := netip.AddrFrom16(ipv4p1.As16())
 
 	testCasesA := []struct {
 		name  string
-		want  []interface{}
+		want  []any
 		rcode int
 		dtyp  uint16
 	}{{
 		name:  "a-record",
 		rcode: dns.RcodeSuccess,
-		want:  []interface{}{ipv4p1},
+		want:  []any{ipv4p1},
 		dtyp:  dns.TypeA,
 	}, {
 		name:  "aaaa-record",
-		want:  []interface{}{ipv6p1},
+		want:  []any{ipv6p1},
 		rcode: dns.RcodeSuccess,
 		dtyp:  dns.TypeAAAA,
 	}, {
 		name:  "txt-record",
-		want:  []interface{}{"hello-world"},
+		want:  []any{"hello-world"},
 		rcode: dns.RcodeSuccess,
 		dtyp:  dns.TypeTXT,
 	}, {
@@ -86,31 +99,37 @@ func TestDNSFilter_CheckHostRules_dnsrewrite(t *testing.T) {
 		dtyp:  0,
 	}, {
 		name:  "a-records",
-		want:  []interface{}{ipv4p1, ipv4p2},
+		want:  []any{ipv4p1, ipv4p2},
 		rcode: dns.RcodeSuccess,
 		dtyp:  dns.TypeA,
 	}, {
 		name:  "aaaa-records",
-		want:  []interface{}{ipv6p1, ipv6p2},
+		want:  []any{ipv6p1, ipv6p2},
 		rcode: dns.RcodeSuccess,
 		dtyp:  dns.TypeAAAA,
 	}, {
 		name:  "disable-one",
-		want:  []interface{}{ipv4p2},
+		want:  []any{ipv4p2},
 		rcode: dns.RcodeSuccess,
 		dtyp:  dns.TypeA,
 	}, {
 		name:  "disable-cname",
-		want:  []interface{}{ipv4p1},
+		want:  []any{ipv4p1},
 		rcode: dns.RcodeSuccess,
 		dtyp:  dns.TypeA,
+	}, {
+		name:  "mapped",
+		want:  []any{mapped},
+		rcode: dns.RcodeSuccess,
+		dtyp:  dns.TypeAAAA,
 	}}
 
 	for _, tc := range testCasesA {
 		t.Run(tc.name, func(t *testing.T) {
 			host := path.Base(tc.name)
 
-			res, err := f.CheckHostRules(host, tc.dtyp, setts)
+			var res filtering.Result
+			res, err = f.CheckHostRules(host, tc.dtyp, setts)
 			require.NoError(t, err)
 
 			dnsrr := res.DNSRewriteResult
@@ -134,7 +153,8 @@ func TestDNSFilter_CheckHostRules_dnsrewrite(t *testing.T) {
 		dtyp := dns.TypeA
 		host := path.Base(t.Name())
 
-		res, err := f.CheckHostRules(host, dtyp, setts)
+		var res filtering.Result
+		res, err = f.CheckHostRules(host, dtyp, setts)
 		require.NoError(t, err)
 
 		assert.Equal(t, "new-cname", res.CanonName)
@@ -144,7 +164,8 @@ func TestDNSFilter_CheckHostRules_dnsrewrite(t *testing.T) {
 		dtyp := dns.TypeA
 		host := path.Base(t.Name())
 
-		res, err := f.CheckHostRules(host, dtyp, setts)
+		var res filtering.Result
+		res, err = f.CheckHostRules(host, dtyp, setts)
 		require.NoError(t, err)
 
 		assert.Equal(t, "new-cname-2", res.CanonName)
@@ -155,7 +176,8 @@ func TestDNSFilter_CheckHostRules_dnsrewrite(t *testing.T) {
 		dtyp := dns.TypeA
 		host := path.Base(t.Name())
 
-		res, err := f.CheckHostRules(host, dtyp, setts)
+		var res filtering.Result
+		res, err = f.CheckHostRules(host, dtyp, setts)
 		require.NoError(t, err)
 
 		assert.Empty(t, res.CanonName)
@@ -166,7 +188,8 @@ func TestDNSFilter_CheckHostRules_dnsrewrite(t *testing.T) {
 		dtyp := dns.TypePTR
 		host := path.Base(t.Name())
 
-		res, err := f.CheckHostRules(host, dtyp, setts)
+		var res filtering.Result
+		res, err = f.CheckHostRules(host, dtyp, setts)
 		require.NoError(t, err)
 		require.NotNil(t, res.DNSRewriteResult)
 
@@ -186,7 +209,8 @@ func TestDNSFilter_CheckHostRules_dnsrewrite(t *testing.T) {
 		dtyp := dns.TypePTR
 		host := path.Base(t.Name())
 
-		res, err := f.CheckHostRules(host, dtyp, setts)
+		var res filtering.Result
+		res, err = f.CheckHostRules(host, dtyp, setts)
 		require.NoError(t, err)
 		require.NotNil(t, res.DNSRewriteResult)
 

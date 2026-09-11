@@ -5,39 +5,33 @@ package aghos
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"os"
-	"os/exec"
 	"path"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/osutil/executil"
 )
 
-// UnsupportedError is returned by functions and methods when a particular
-// operation Op cannot be performed on the current OS.
-type UnsupportedError struct {
-	Op string
-	OS string
-}
+// Default file, binary, and directory permissions.
+const (
+	DefaultPermDir  fs.FileMode = 0o700
+	DefaultPermExe  fs.FileMode = 0o700
+	DefaultPermFile fs.FileMode = 0o600
+)
 
-// Error implements the error interface for *UnsupportedError.
-func (err *UnsupportedError) Error() (msg string) {
-	return fmt.Sprintf("%s is unsupported on %s", err.Op, err.OS)
-}
-
-// Unsupported is a helper that returns an *UnsupportedError with the Op field
-// set to op and the OS field set to the current OS.
+// Unsupported is a helper that returns a wrapped [errors.ErrUnsupported].
 func Unsupported(op string) (err error) {
-	return &UnsupportedError{
-		Op: op,
-		OS: runtime.GOOS,
-	}
+	return fmt.Errorf("%s: not supported on %s: %w", op, runtime.GOOS, errors.ErrUnsupported)
 }
 
 // SetRlimit sets user-specified limit of how many fd's we can use.
@@ -52,52 +46,54 @@ func HaveAdminRights() (bool, error) {
 	return haveAdminRights()
 }
 
-// MaxCmdOutputSize is the maximum length of performed shell command output.
-const MaxCmdOutputSize = 2 * 1024
+// MaxCmdOutputSize is the maximum length of performed shell command output in
+// bytes.
+const MaxCmdOutputSize = 64 * 1024
 
-// RunCommand runs shell command.
-func RunCommand(command string, arguments ...string) (int, string, error) {
-	cmd := exec.Command(command, arguments...)
-	out, err := cmd.Output()
-	if len(out) > MaxCmdOutputSize {
-		out = out[:MaxCmdOutputSize]
-	}
-
-	if errors.As(err, new(*exec.ExitError)) {
-		return cmd.ProcessState.ExitCode(), string(out), nil
-	} else if err != nil {
-		return 1, "", fmt.Errorf("exec.Command(%s) failed: %w: %s", command, err, string(out))
-	}
-
-	return cmd.ProcessState.ExitCode(), string(out), nil
-}
+// psArgs holds the default ps arguments to avoid per-call slice allocations.
+//
+// Don't use -C flag here since it's a feature of linux's ps
+// implementation.  Use POSIX-compatible flags instead.
+//
+// See https://github.com/AdguardTeam/AdGuardHome/issues/3457.
+var psArgs = []string{"-A", "-o", "pid=", "-o", "comm="}
 
 // PIDByCommand searches for process named command and returns its PID ignoring
-// the PIDs from except.  If no processes found, the error returned.
-func PIDByCommand(command string, except ...int) (pid int, err error) {
-	// Don't use -C flag here since it's a feature of linux's ps
-	// implementation.  Use POSIX-compatible flags instead.
+// the PIDs from except.  If no processes found, the error returned.  l must not
+// be nil.
+func PIDByCommand(
+	ctx context.Context,
+	l *slog.Logger,
+	command string,
+	except ...int,
+) (pid int, err error) {
+	const psCmd = "ps"
+
+	l.DebugContext(ctx, "executing", "cmd", psCmd, "args", psArgs)
+
+	stdoutBuf := bytes.Buffer{}
+
+	// TODO(s.chzhen):  Catch stderr.
 	//
-	// See https://github.com/AdguardTeam/AdGuardHome/issues/3457.
-	cmd := exec.Command("ps", "-A", "-o", "pid=", "-o", "comm=")
-
-	var stdout io.ReadCloser
-	if stdout, err = cmd.StdoutPipe(); err != nil {
-		return 0, fmt.Errorf("getting the command's stdout pipe: %w", err)
-	}
-
-	if err = cmd.Start(); err != nil {
-		return 0, fmt.Errorf("start command executing: %w", err)
-	}
+	// TODO(s.chzhen):  Consider streaming the output if needed.  Using
+	// [io.Pipe] here is unnecessary; it complicates lifecycle management
+	// because the output must be read concurrently, and the PipeWriter must be
+	// explicitly closed to signal EOF.  Since this command's output is small, a
+	// bytes.Buffer via executil.Run is sufficient.
+	runErr := executil.Run(
+		ctx,
+		executil.SystemCommandConstructor{},
+		&executil.CommandConfig{
+			Path:   psCmd,
+			Args:   psArgs,
+			Stdout: &stdoutBuf,
+		},
+	)
 
 	var instNum int
-	pid, instNum, err = parsePSOutput(stdout, command, except)
+	pid, instNum, err = parsePSOutput(&stdoutBuf, command, except)
 	if err != nil {
 		return 0, err
-	}
-
-	if err = cmd.Wait(); err != nil {
-		return 0, fmt.Errorf("executing the command: %w", err)
 	}
 
 	switch instNum {
@@ -107,24 +103,27 @@ func PIDByCommand(command string, except ...int) (pid int, err error) {
 	case 1:
 		// Go on.
 	default:
-		log.Info("warning: %d %s instances found", instNum, command)
+		l.WarnContext(ctx, "instances found", "num", instNum, "command", command)
 	}
 
-	if code := cmd.ProcessState.ExitCode(); code != 0 {
-		return 0, fmt.Errorf("ps finished with code %d", code)
+	if runErr != nil {
+		if code, ok := executil.ExitCodeFromError(runErr); ok {
+			return 0, fmt.Errorf("ps finished with code %d", code)
+		}
+
+		return 0, fmt.Errorf("executing the command: %w", runErr)
 	}
 
 	return pid, nil
 }
 
 // parsePSOutput scans the output of ps searching the largest PID of the process
-// associated with cmdName ignoring PIDs from ignore.  A valid line from
-// r should look like these:
+// associated with cmdName ignoring PIDs from ignore.  A valid line from r
+// should look like these:
 //
-//    123 ./example-cmd
-//   1230 some/base/path/example-cmd
-//   3210 example-cmd
-//
+//	 123 ./example-cmd
+//	1230 some/base/path/example-cmd
+//	3210 example-cmd
 func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum int, err error) {
 	s := bufio.NewScanner(r)
 	for s.Scan() {
@@ -134,14 +133,12 @@ func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum 
 		}
 
 		cur, aerr := strconv.Atoi(fields[0])
-		if aerr != nil || cur < 0 || intIn(cur, ignore) {
+		if aerr != nil || cur < 0 || slices.Contains(ignore, cur) {
 			continue
 		}
 
 		instNum++
-		if cur > largest {
-			largest = cur
-		}
+		largest = max(largest, cur)
 	}
 	if err = s.Err(); err != nil {
 		return 0, 0, fmt.Errorf("scanning stdout: %w", err)
@@ -150,25 +147,19 @@ func parsePSOutput(r io.Reader, cmdName string, ignore []int) (largest, instNum 
 	return largest, instNum, nil
 }
 
-// intIn returns true if nums contains n.
-func intIn(n int, nums []int) (ok bool) {
-	for _, nn := range nums {
-		if n == nn {
-			return true
-		}
-	}
-
-	return false
-}
-
 // IsOpenWrt returns true if host OS is OpenWrt.
 func IsOpenWrt() (ok bool) {
 	return isOpenWrt()
 }
 
-// RootDirFS returns the fs.FS rooted at the operating system's root.
-func RootDirFS() (fsys fs.FS) {
-	// Use empty string since os.DirFS implicitly prepends a slash to it.  This
-	// behavior is undocumented but it currently works.
-	return os.DirFS("")
+// SendShutdownSignal sends the shutdown signal to the channel.
+func SendShutdownSignal(c chan<- os.Signal) {
+	sendShutdownSignal(c)
+}
+
+// RootDir returns the root directory for the current OS.
+//
+// TODO(e.burkov):  Deprecate [osutil.RootDirFS] and move it there.
+func RootDir() (dir string) {
+	return rootDir()
 }

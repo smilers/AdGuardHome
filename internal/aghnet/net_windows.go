@@ -1,30 +1,42 @@
-//go:build !(linux || darwin || freebsd || openbsd)
-// +build !linux,!darwin,!freebsd,!openbsd
+//go:build windows
 
 package aghnet
 
 import (
+	"context"
 	"io"
+	"log/slog"
 	"syscall"
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/osutil/executil"
 	"golang.org/x/sys/windows"
 )
 
-func canBindPrivilegedPorts() (can bool, err error) {
-	return aghos.HaveAdminRights()
+func canBindPrivilegedPorts(_ context.Context, _ *slog.Logger) (can bool, err error) {
+	return true, nil
 }
 
-func ifaceHasStaticIP(string) (ok bool, err error) {
+func ifaceHasStaticIP(
+	_ context.Context,
+	_ executil.CommandConstructor,
+	_ string,
+) (ok bool, err error) {
 	return false, aghos.Unsupported("checking static ip")
 }
 
-func ifaceSetStaticIP(string) (err error) {
+func ifaceSetStaticIP(
+	_ context.Context,
+	_ *slog.Logger,
+	_ executil.CommandConstructor,
+	_ string,
+) (err error) {
 	return aghos.Unsupported("setting static ip")
 }
 
+// closePortChecker closes c.  c must be non-nil.
 func closePortChecker(c io.Closer) (err error) {
 	if err = c.Close(); err != nil {
 		return err

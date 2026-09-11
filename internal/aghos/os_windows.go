@@ -1,13 +1,16 @@
 //go:build windows
-// +build windows
 
 package aghos
 
 import (
+	"os"
+	"path/filepath"
+
+	"github.com/AdguardTeam/golibs/errors"
 	"golang.org/x/sys/windows"
 )
 
-func setRlimit(val uint64) (err error) {
+func setRlimit(_ uint64) (err error) {
 	return Unsupported("setrlimit")
 }
 
@@ -18,11 +21,11 @@ func haveAdminRights() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	defer func() { err = errors.WithDeferred(err, token.Close()) }()
 
 	info := make([]byte, 4)
 	var returnedLen uint32
 	err = windows.GetTokenInformation(token, windows.TokenElevation, &info[0], uint32(len(info)), &returnedLen)
-	token.Close()
 	if err != nil {
 		return false, err
 	}
@@ -34,4 +37,19 @@ func haveAdminRights() (bool, error) {
 
 func isOpenWrt() (ok bool) {
 	return false
+}
+
+func sendShutdownSignal(c chan<- os.Signal) {
+	c <- os.Interrupt
+}
+
+func rootDir() (dir string) {
+	// TODO(e.burkov): Use a better way if golang/go#44279 is ever resolved.
+	sysDir, err := windows.GetSystemDirectory()
+	if err != nil {
+		// Assume that C:\ is the safe default.
+		return `C:\`
+	}
+
+	return filepath.Join(filepath.VolumeName(sysDir), `\`)
 }

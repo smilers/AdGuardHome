@@ -3,40 +3,51 @@ package home
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io/fs"
-	"net"
+	"log"
+	"log/slog"
 	"net/http"
-	"net/http/pprof"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/agh"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghslog"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghtls"
+	"github.com/AdguardTeam/AdGuardHome/internal/arpdb"
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpd"
 	"github.com/AdguardTeam/AdGuardHome/internal/dnsforward"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering/hashprefix"
+	"github.com/AdguardTeam/AdGuardHome/internal/filtering/safesearch"
+	"github.com/AdguardTeam/AdGuardHome/internal/permcheck"
 	"github.com/AdguardTeam/AdGuardHome/internal/querylog"
 	"github.com/AdguardTeam/AdGuardHome/internal/stats"
 	"github.com/AdguardTeam/AdGuardHome/internal/updater"
 	"github.com/AdguardTeam/AdGuardHome/internal/version"
+	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/hostsfile"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/netutil"
-	"gopkg.in/natefinch/lumberjack.v2"
-)
-
-const (
-	// Used in config to indicate that syslog or eventlog (win) should be used for logger output
-	configSyslog = "syslog"
+	"github.com/AdguardTeam/golibs/netutil/httputil"
+	"github.com/AdguardTeam/golibs/netutil/urlutil"
+	"github.com/AdguardTeam/golibs/osutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
+	"github.com/AdguardTeam/golibs/service"
 )
 
 // Global context
@@ -44,147 +55,178 @@ type homeContext struct {
 	// Modules
 	// --
 
-	clients    clientsContainer     // per-client-settings module
-	stats      stats.Stats          // statistics module
-	queryLog   querylog.QueryLog    // query log module
-	dnsServer  *dnsforward.Server   // DNS module
-	rdns       *RDNS                // rDNS module
-	whois      *WHOIS               // WHOIS module
-	dnsFilter  *filtering.DNSFilter // DNS filtering module
-	dhcpServer *dhcpd.Server        // DHCP module
-	auth       *Auth                // HTTP authentication module
-	filters    Filtering            // DNS filtering module
-	web        *Web                 // Web (HTTP, HTTPS) module
-	tls        *TLSMod              // TLS module
-	// etcHosts is an IP-hostname pairs set taken from system configuration
-	// (e.g. /etc/hosts) files.
-	etcHosts *aghnet.HostsContainer
-	// hostsWatcher is the watcher to detect changes in the hosts files.
-	hostsWatcher aghos.FSWatcher
+	clients    clientsContainer   // per-client-settings module
+	stats      stats.Interface    // statistics module
+	queryLog   querylog.QueryLog  // query log module
+	dnsServer  *dnsforward.Server // DNS module
+	dhcpServer dhcpd.Interface    // DHCP module
 
-	updater *updater.Updater
+	filters *filtering.DNSFilter // DNS filtering module
 
-	subnetDetector *aghnet.SubnetDetector
-
-	// mux is our custom http.ServeMux.
-	mux *http.ServeMux
-
-	// Runtime properties
-	// --
-
-	configFilename   string // Config filename (can be overridden via the command line arguments)
-	workDir          string // Location of our directory, used to protect against CWD being somewhere else
-	firstRun         bool   // if set to true, don't run any services except HTTP web interface, and serve only first-run html
-	pidFileName      string // PID file name.  Empty if no PID file was created.
-	disableUpdate    bool   // If set, don't check for updates
-	controlLock      sync.Mutex
-	tlsRoots         *x509.CertPool // list of root CAs for TLSv1.2
-	tlsCiphers       []uint16       // list of TLS ciphers to use
-	transport        *http.Transport
-	client           *http.Client
-	appSignalChannel chan os.Signal // Channel for receiving OS signals by the console app
-	// runningAsService flag is set to true when options are passed from the service runner
-	runningAsService bool
+	controlLock sync.Mutex
 }
 
-// getDataDir returns path to the directory where we store databases and filters
-func (c *homeContext) getDataDir() string {
-	return filepath.Join(c.workDir, dataDir)
-}
-
-// Context - a global context object
-var Context homeContext
+// globalContext is a global context object.
+//
+// TODO(a.garipov): Refactor.
+var globalContext homeContext
 
 // Main is the entry point
 func Main(clientBuildFS fs.FS) {
-	// config can be specified, which reads options from there, but other command line flags have to override config values
-	// therefore, we must do it manually instead of using a lib
-	args := loadOptions()
+	ctx := context.Background()
 
-	Context.appSignalChannel = make(chan os.Signal)
-	signal.Notify(Context.appSignalChannel, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
-	go func() {
-		for {
-			sig := <-Context.appSignalChannel
-			log.Info("Received signal %q", sig)
-			switch sig {
-			case syscall.SIGHUP:
-				Context.clients.Reload()
-				Context.tls.Reload()
+	initCmdLineOpts()
 
-			default:
-				cleanup(context.Background())
-				cleanupAlways()
-				os.Exit(0)
-			}
+	// The configuration file path can be overridden, but other command-line
+	// options have to override config values.  Therefore, do it manually
+	// instead of using package flag.
+	//
+	// TODO(a.garipov): The comment above is most likely false.  Replace with
+	// package flag.
+	opts := loadCmdLineOpts()
+
+	// TODO(s.chzhen):  Construct logger from command-line options.
+	l := slog.Default()
+	workDir, err := initWorkingDir(opts)
+	if err != nil {
+		l.ErrorContext(ctx, "failed to init working directory", slogutil.KeyError, err)
+
+		os.Exit(osutil.ExitCodeFailure)
+	}
+
+	confPath := initConfigFilename(ctx, l, opts, workDir)
+
+	ls := newLogSettings(ctx, l, opts, workDir, confPath)
+
+	// TODO(a.garipov): Use slog everywhere.
+	baseLogger := newSlogLogger(ls)
+
+	// Configure log level and output.
+	err = configureLogger(ls, workDir)
+	fatalOnError(ctx, baseLogger, err)
+
+	// Print the first message after logger is configured.
+	baseLogger.InfoContext(ctx, "starting adguard home", "version", version.Full())
+	baseLogger.DebugContext(ctx, "current working directory", "path", workDir)
+	if opts.runningAsService {
+		baseLogger.InfoContext(ctx, "adguard home is running as a service")
+	}
+
+	var glTokenFileRoot *os.Root
+	if opts.glinetMode {
+		glTokenFileRoot, err = os.OpenRoot("/tmp/")
+		fatalOnError(ctx, baseLogger, err)
+	}
+
+	done := make(chan struct{})
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
+
+	var (
+		hc        *aghnet.HostsContainer
+		hcWatcher service.Interface = service.Empty{}
+	)
+	if !opts.noEtcHosts {
+		hc, hcWatcher, err = newHostsContainer(ctx, baseLogger)
+		fatalOnError(ctx, baseLogger, err)
+	}
+
+	pidFilePath := setPIDFilePath(ctx, baseLogger, opts)
+	sigHdlrLogger := baseLogger.With(slogutil.KeyPrefix, "signalhdlr")
+	sigHdlrCleanup := &signalHandlerCleanup{
+		logger:          sigHdlrLogger,
+		hostsContainer:  hc,
+		glTokenFileRoot: glTokenFileRoot,
+		hcWatcher:       hcWatcher,
+		done:            done,
+		pidFilePath:     pidFilePath,
+		glinetMode:      opts.glinetMode,
+	}
+
+	sigHdlr := newSignalHandler(sigHdlrLogger, signals, sigHdlrCleanup.cleanup)
+
+	go sigHdlr.handle(ctx)
+
+	if opts.serviceControlAction != "" {
+		svcLogger := baseLogger.With(slogutil.KeyPrefix, "service")
+		err = handleServiceControlAction(
+			ctx,
+			baseLogger,
+			svcLogger,
+			glTokenFileRoot,
+			opts,
+			clientBuildFS,
+			signals,
+			done,
+			sigHdlr,
+			workDir,
+			confPath,
+			pidFilePath,
+			hc,
+		)
+		if err != nil {
+			svcLogger.ErrorContext(ctx, "action failed", slogutil.KeyError, err)
+			os.Exit(osutil.ExitCodeFailure)
 		}
-	}()
-
-	if args.serviceControlAction != "" {
-		handleServiceControlAction(args, clientBuildFS)
 
 		return
 	}
 
 	// run the protection
-	run(args, clientBuildFS)
+	run(
+		ctx,
+		baseLogger,
+		opts,
+		clientBuildFS,
+		glTokenFileRoot,
+		done,
+		sigHdlr,
+		workDir,
+		confPath,
+		pidFilePath,
+		hc,
+	)
 }
 
-func setupContext(args options) {
-	Context.runningAsService = args.runningAsService
-	Context.disableUpdate = args.disableUpdate ||
-		version.Channel() == version.ChannelDevelopment
+// setupContext initializes [globalContext] fields.  It also reads and upgrades
+// config file if necessary.  baseLogger must not be nil.
+func setupContext(
+	ctx context.Context,
+	baseLogger *slog.Logger,
+	opts options,
+	workDir string,
+	confPath string,
+	isFirstRun bool,
+) {
+	if isFirstRun {
+		baseLogger.InfoContext(ctx, "this is the first time adguard home has been launched")
+		checkNetworkPermissions(ctx, baseLogger)
 
-	Context.firstRun = detectFirstRun()
-	if Context.firstRun {
-		log.Info("This is the first time AdGuard Home is launched")
-		checkPermissions()
+		return
 	}
 
-	initConfig()
+	// TODO(s.chzhen):  Consider adding a key prefix.
+	err := parseConfig(ctx, baseLogger, workDir, confPath)
+	if err != nil {
+		baseLogger.ErrorContext(ctx, "failed to parse configuration file", slogutil.KeyError, err)
 
-	Context.tlsRoots = LoadSystemRootCAs()
-	Context.tlsCiphers = InitTLSCiphers()
-	Context.transport = &http.Transport{
-		DialContext: customDialContext,
-		Proxy:       getHTTPProxy,
-		TLSClientConfig: &tls.Config{
-			RootCAs:    Context.tlsRoots,
-			MinVersion: tls.VersionTLS12,
-		},
-	}
-	Context.client = &http.Client{
-		Timeout:   time.Minute * 5,
-		Transport: Context.transport,
+		os.Exit(osutil.ExitCodeFailure)
 	}
 
-	if !Context.firstRun {
-		// Do the upgrade if necessary.
-		err := upgradeConfig()
-		fatalOnError(err)
+	if opts.checkConfig {
+		baseLogger.InfoContext(ctx, "configuration file is ok")
 
-		if err = parseConfig(); err != nil {
-			log.Error("parsing configuration file: %s", err)
-
-			os.Exit(1)
-		}
-
-		if args.checkConfig {
-			log.Info("configuration file is ok")
-
-			os.Exit(0)
-		}
+		os.Exit(osutil.ExitCodeSuccess)
 	}
-
-	Context.mux = http.NewServeMux()
 }
 
 // logIfUnsupported logs a formatted warning if the error is one of the
 // unsupported errors and returns nil.  If err is nil, logIfUnsupported returns
-// nil.  Otherise, it returns err.
-func logIfUnsupported(msg string, err error) (outErr error) {
-	if errors.As(err, new(*aghos.UnsupportedError)) {
-		log.Debug(msg, err)
+// nil.  Otherwise, it returns err.
+func logIfUnsupported(ctx context.Context, l *slog.Logger, msg string, err error) (outErr error) {
+	if errors.Is(err, errors.ErrUnsupported) {
+		l.DebugContext(ctx, msg, slogutil.KeyError, err)
 
 		return nil
 	}
@@ -192,8 +234,9 @@ func logIfUnsupported(msg string, err error) (outErr error) {
 	return err
 }
 
-// configureOS sets the OS-related configuration.
-func configureOS(conf *configuration) (err error) {
+// configureOS sets the OS-related configuration.  l and conf must not be nil.
+// conf must be valid.
+func configureOS(ctx context.Context, l *slog.Logger, conf *configuration) (err error) {
 	osConf := conf.OSConfig
 	if osConf == nil {
 		return nil
@@ -201,72 +244,108 @@ func configureOS(conf *configuration) (err error) {
 
 	if osConf.Group != "" {
 		err = aghos.SetGroup(osConf.Group)
-		err = logIfUnsupported("warning: setting group", err)
+		err = logIfUnsupported(ctx, l, "warning: setting group", err)
 		if err != nil {
 			return fmt.Errorf("setting group: %w", err)
 		}
 
-		log.Info("group set to %s", osConf.Group)
+		l.InfoContext(ctx, "group set", "groupname", osConf.Group)
 	}
 
 	if osConf.User != "" {
 		err = aghos.SetUser(osConf.User)
-		err = logIfUnsupported("warning: setting user", err)
+		err = logIfUnsupported(ctx, l, "warning: setting user", err)
 		if err != nil {
 			return fmt.Errorf("setting user: %w", err)
 		}
 
-		log.Info("user set to %s", osConf.User)
+		l.InfoContext(ctx, "user set", "username", osConf.User)
 	}
 
 	if osConf.RlimitNoFile != 0 {
 		err = aghos.SetRlimit(osConf.RlimitNoFile)
-		err = logIfUnsupported("warning: setting rlimit", err)
+		err = logIfUnsupported(ctx, l, "warning: setting rlimit", err)
 		if err != nil {
 			return fmt.Errorf("setting rlimit: %w", err)
 		}
 
-		log.Info("rlimit_nofile set to %d", osConf.RlimitNoFile)
+		l.InfoContext(ctx, "rlimit_nofile set", "rlimit_nofile", osConf.RlimitNoFile)
 	}
 
 	return nil
 }
 
-// setupHostsContainer initializes the structures to keep up-to-date the hosts
-// provided by the OS.
-func setupHostsContainer() (err error) {
-	Context.hostsWatcher, err = aghos.NewOSWritesWatcher()
+// newHostsContainer initializes the structures to keep up-to-date the hosts
+// provided by the OS.  baseLogger must not be nil.
+func newHostsContainer(
+	ctx context.Context,
+	baseLogger *slog.Logger,
+) (etcHosts *aghnet.HostsContainer, watcher aghos.FSWatcher, err error) {
+	l := baseLogger.With(slogutil.KeyPrefix, "hosts")
+
+	watcher, err = aghos.NewOSWatcher(&aghos.OSWatcherConfig{
+		Logger: baseLogger.With(slogutil.KeyPrefix, "hosts_watcher"),
+	})
 	if err != nil {
-		return fmt.Errorf("initing hosts watcher: %w", err)
+		l.WarnContext(
+			ctx,
+			"initializing filesystem watcher; not watching for changes",
+			slogutil.KeyError,
+			err,
+		)
+
+		watcher = aghos.EmptyFSWatcher{}
 	}
 
-	Context.etcHosts, err = aghnet.NewHostsContainer(
-		filtering.SysHostsListID,
-		aghos.RootDirFS(),
-		Context.hostsWatcher,
-		aghnet.DefaultHostsPaths()...,
+	paths, err := hostsfile.DefaultHostsPaths()
+	if err != nil {
+		return nil, nil, fmt.Errorf("getting default system hosts paths: %w", err)
+	}
+
+	etcHosts, err = aghnet.NewHostsContainer(
+		ctx,
+		l,
+		osutil.RootDirFS(),
+		watcher,
+		paths...,
 	)
 	if err != nil {
-		cerr := Context.hostsWatcher.Close()
-		if errors.Is(err, aghnet.ErrNoHostsPaths) && cerr == nil {
-			log.Info("warning: initing hosts container: %s", err)
+		closeErr := watcher.Shutdown(ctx)
+		if errors.Is(err, aghnet.ErrNoHostsPaths) {
+			l.WarnContext(ctx, "initializing hosts container", slogutil.KeyError, err)
 
-			return nil
+			return nil, nil, closeErr
 		}
 
-		return errors.WithDeferred(fmt.Errorf("initing hosts container: %w", err), cerr)
+		err = fmt.Errorf("initializing hosts container: %w", err)
+
+		return nil, nil, errors.WithDeferred(err, closeErr)
 	}
 
-	return nil
+	return etcHosts, watcher, watcher.Start(ctx)
 }
 
-func setupConfig(args options) (err error) {
-	config.DHCP.WorkDir = Context.workDir
-	config.DHCP.HTTPRegister = httpRegister
-	config.DHCP.ConfigModified = onConfigModified
+// initContextClients initializes Context clients and related fields.  All
+// arguments except hc must not be nil.
+func initContextClients(
+	ctx context.Context,
+	logger *slog.Logger,
+	sigHdlr *signalHandler,
+	confModifier agh.ConfigModifier,
+	httpReg aghhttp.Registrar,
+	workDir string,
+	hc *aghnet.HostsContainer,
+) (err error) {
+	//lint:ignore SA1019 Migration is not over.
+	config.DHCP.WorkDir = workDir
+	config.DHCP.DataDir = filepath.Join(workDir, dataDir)
+	config.DHCP.HTTPReg = httpReg
+	config.DHCP.CommandConstructor = executil.SystemCommandConstructor{}
+	config.DHCP.Logger = logger.With(slogutil.KeyPrefix, "dhcpd")
+	config.DHCP.ConfModifier = confModifier
 
-	Context.dhcpServer, err = dhcpd.Create(config.DHCP)
-	if Context.dhcpServer == nil || err != nil {
+	globalContext.dhcpServer, err = dhcpd.Create(ctx, config.DHCP)
+	if globalContext.dhcpServer == nil || err != nil {
 		// TODO(a.garipov): There are a lot of places in the code right
 		// now which assume that the DHCP server can be nil despite this
 		// condition.  Inspect them and perhaps rewrite them to use
@@ -274,616 +353,1110 @@ func setupConfig(args options) (err error) {
 		return fmt.Errorf("initing dhcp: %w", err)
 	}
 
-	Context.updater = updater.NewUpdater(&updater.Config{
-		Client:   Context.client,
-		Version:  version.Version(),
-		Channel:  version.Channel(),
-		GOARCH:   runtime.GOARCH,
-		GOOS:     runtime.GOOS,
-		GOARM:    version.GOARM(),
-		GOMIPS:   version.GOMIPS(),
-		WorkDir:  Context.workDir,
-		ConfName: config.getConfigFilename(),
-	})
-
-	if !args.noEtcHosts {
-		if err = setupHostsContainer(); err != nil {
-			return err
-		}
+	var arpDB arpdb.Interface
+	if config.Clients.Sources.ARP {
+		arpDB = arpdb.New(logger.With(slogutil.KeyError, "arpdb"))
 	}
 
-	Context.clients.Init(config.Clients, Context.dhcpServer, Context.etcHosts)
+	return globalContext.clients.Init(
+		ctx,
+		logger,
+		config.Clients.Persistent,
+		globalContext.dhcpServer,
+		hc,
+		arpDB,
+		config.Filtering,
+		sigHdlr,
+		confModifier,
+		httpReg,
+	)
+}
 
-	if args.bindPort != 0 {
-		pm := portsMap{}
-		pm.add(
-			args.bindPort,
-			config.BetaBindPort,
-			config.DNS.Port,
+// setPIDFilePath writes the PID value to a file and returns its path, if the
+// PID file is required.  l must not be nil.
+func setPIDFilePath(ctx context.Context, l *slog.Logger, opts options) (pidFilePath string) {
+	if pidFileRequired(opts) && writePIDFile(ctx, l, opts.pidFile) {
+		pidFilePath = opts.pidFile
+	}
+
+	return pidFilePath
+}
+
+// pidFileRequired returns true if the PID file is required.
+func pidFileRequired(opts options) (ok bool) {
+	return opts.pidFile != "" &&
+		!opts.performUpdate &&
+		!opts.checkConfig &&
+		(opts.serviceControlAction == "" ||
+			opts.serviceControlAction == "run")
+}
+
+// setupBindOpts overrides bind host/port from the opts.
+func setupBindOpts(opts options) (err error) {
+	bindAddr := opts.bindAddr
+	if bindAddr != (netip.AddrPort{}) {
+		config.HTTPConfig.Address = bindAddr
+
+		if config.HTTPConfig.Address.Port() != 0 {
+			err = checkPorts()
+			if err != nil {
+				// Don't wrap the error, because it's informative enough as is.
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	if opts.bindPort != 0 {
+		config.HTTPConfig.Address = netip.AddrPortFrom(
+			config.HTTPConfig.Address.Addr(),
+			opts.bindPort,
 		)
-		if config.TLS.Enabled {
-			pm.add(
-				config.TLS.PortHTTPS,
-				config.TLS.PortDNSOverTLS,
-				config.TLS.PortDNSOverQUIC,
-				config.TLS.PortDNSCrypt,
-			)
-		}
-		if err = pm.validate(); err != nil {
+
+		err = checkPorts()
+		if err != nil {
+			// Don't wrap the error, because it's informative enough as is.
 			return err
 		}
-
-		config.BindPort = args.bindPort
 	}
 
-	// override bind host/port from the console
-	if args.bindHost != nil {
-		config.BindHost = args.bindHost
-	}
-	if len(args.pidFile) != 0 && writePIDFile(args.pidFile) {
-		Context.pidFileName = args.pidFile
+	if opts.bindHost.IsValid() {
+		config.HTTPConfig.Address = netip.AddrPortFrom(
+			opts.bindHost,
+			config.HTTPConfig.Address.Port(),
+		)
 	}
 
 	return nil
 }
 
-func initWeb(args options, clientBuildFS fs.FS) (web *Web, err error) {
-	var clientFS, clientBetaFS fs.FS
-	if args.localFrontend {
-		log.Info("warning: using local frontend files")
+// setupDNSFilteringConf sets up DNS filtering configuration settings.  All
+// arguments except hc must not be nil.
+func setupDNSFilteringConf(
+	ctx context.Context,
+	baseLogger *slog.Logger,
+	conf *filtering.Config,
+	tlsMgr aghtls.Manager,
+	confModifier agh.ConfigModifier,
+	httpReg aghhttp.Registrar,
+	workDir string,
+	hc *aghnet.HostsContainer,
+) (err error) {
+	const (
+		dnsTimeout = 3 * time.Second
+
+		sbService                 = "safe_browsing"
+		defaultSafeBrowsingServer = `https://family.adguard-dns.com/dns-query`
+		sbTXTSuffix               = `sb.dns.adguard.com.`
+
+		pcService             = "parental_control"
+		defaultParentalServer = `https://family.adguard-dns.com/dns-query`
+		pcTXTSuffix           = `pc.dns.adguard.com.`
+	)
+
+	conf.Logger = baseLogger.With(slogutil.KeyPrefix, "filtering")
+
+	// TODO(s.chzhen):  Use empty interface.
+	if hc != nil && config.DNS.HostsFileEnabled {
+		conf.EtcHosts = hc
+	}
+
+	conf.ConfModifier = confModifier
+	conf.HTTPReg = httpReg
+	conf.DataDir = filepath.Join(workDir, dataDir)
+	conf.Filters = slices.Clone(config.Filters)
+	conf.WhitelistFilters = slices.Clone(config.WhitelistFilters)
+	conf.UserRules = slices.Clone(config.UserRules)
+	conf.HTTPClient = httpClient(tlsMgr)
+
+	cacheTime := time.Duration(conf.CacheTime) * time.Minute
+
+	upsOpts := &upstream.Options{
+		Logger:  aghslog.NewForUpstream(baseLogger, aghslog.UpstreamTypeService),
+		Timeout: dnsTimeout,
+		Bootstrap: upstream.StaticResolver{
+			// 94.140.14.15.
+			netip.AddrFrom4([4]byte{94, 140, 14, 15}),
+			// 94.140.14.16.
+			netip.AddrFrom4([4]byte{94, 140, 14, 16}),
+			// 2a10:50c0::bad1:ff.
+			netip.AddrFrom16([16]byte{42, 16, 80, 192, 12: 186, 209, 0, 255}),
+			// 2a10:50c0::bad2:ff.
+			netip.AddrFrom16([16]byte{42, 16, 80, 192, 12: 186, 210, 0, 255}),
+		},
+	}
+
+	sbUps, err := upstream.AddressToUpstream(defaultSafeBrowsingServer, upsOpts)
+	if err != nil {
+		return fmt.Errorf("converting safe browsing server: %w", err)
+	}
+
+	conf.SafeBrowsingChecker = hashprefix.New(&hashprefix.Config{
+		Logger:    baseLogger.With(slogutil.KeyPrefix, sbService),
+		Upstream:  sbUps,
+		TXTSuffix: sbTXTSuffix,
+		CacheTime: cacheTime,
+		CacheSize: conf.SafeBrowsingCacheSize,
+	})
+
+	// Protect against invalid configuration, see #6181.
+	//
+	// TODO(a.garipov): Validate against an empty host instead of setting it to
+	// default.
+	if conf.SafeBrowsingBlockHost == "" {
+		host := defaultSafeBrowsingBlockHost
+		baseLogger.WarnContext(
+			ctx,
+			"empty blocking host; set default",
+			"service", sbService,
+			"host", host,
+		)
+
+		conf.SafeBrowsingBlockHost = host
+	}
+
+	parUps, err := upstream.AddressToUpstream(defaultParentalServer, upsOpts)
+	if err != nil {
+		return fmt.Errorf("converting parental server: %w", err)
+	}
+
+	conf.ParentalControlChecker = hashprefix.New(&hashprefix.Config{
+		Logger:    baseLogger.With(slogutil.KeyPrefix, pcService),
+		Upstream:  parUps,
+		TXTSuffix: pcTXTSuffix,
+		CacheTime: cacheTime,
+		CacheSize: conf.ParentalCacheSize,
+	})
+
+	// Protect against invalid configuration, see #6181.
+	//
+	// TODO(a.garipov): Validate against an empty host instead of setting it to
+	// default.
+	if conf.ParentalBlockHost == "" {
+		host := defaultParentalBlockHost
+		baseLogger.WarnContext(
+			ctx,
+			"empty blocking host; set default",
+			"service", pcService,
+			"host", host,
+		)
+
+		conf.ParentalBlockHost = host
+	}
+
+	logger := baseLogger.With(slogutil.KeyPrefix, safesearch.LogPrefix)
+	conf.SafeSearch, err = safesearch.NewDefault(ctx, &safesearch.DefaultConfig{
+		Logger:         logger,
+		ServicesConfig: conf.SafeSearchConf,
+		CacheSize:      conf.SafeSearchCacheSize,
+		CacheTTL:       cacheTime,
+	})
+	if err != nil {
+		return fmt.Errorf("initializing safesearch: %w", err)
+	}
+
+	return nil
+}
+
+// checkPorts is a helper for ports validation in config.
+func checkPorts() (err error) {
+	tcpPorts := aghalg.UniqChecker[tcpPort]{}
+	addPorts(tcpPorts, tcpPort(config.HTTPConfig.Address.Port()))
+
+	udpPorts := aghalg.UniqChecker[udpPort]{}
+	addPorts(udpPorts, udpPort(config.DNS.Port))
+
+	if config.TLS.Enabled {
+		addPorts(
+			tcpPorts,
+			tcpPort(config.TLS.PortHTTPS),
+			tcpPort(config.TLS.PortDNSOverTLS),
+			tcpPort(config.TLS.PortDNSCrypt),
+		)
+
+		addPorts(udpPorts, udpPort(config.TLS.PortDNSOverQUIC))
+	}
+
+	if err = tcpPorts.Validate(); err != nil {
+		return fmt.Errorf("validating tcp ports: %w", err)
+	} else if err = udpPorts.Validate(); err != nil {
+		return fmt.Errorf("validating udp ports: %w", err)
+	}
+
+	return nil
+}
+
+// isUpdateEnabled returns true if the update is enabled for current
+// configuration.  It also logs the decision.  isCustomURL should be true if the
+// updater is using a custom URL.
+func isUpdateEnabled(
+	ctx context.Context,
+	l *slog.Logger,
+	opts *options,
+	isCustomURL bool,
+) (ok bool) {
+	if opts.disableUpdate {
+		l.DebugContext(ctx, "updates are disabled by command-line option")
+
+		return false
+	}
+
+	switch version.Channel() {
+	case
+		version.ChannelDevelopment,
+		version.ChannelCandidate:
+		if isCustomURL {
+			l.DebugContext(ctx, "updates are enabled because custom url is used")
+		} else {
+			l.DebugContext(ctx, "updates are disabled for development and candidate builds")
+		}
+
+		return isCustomURL
+	default:
+		l.DebugContext(ctx, "updates are enabled")
+
+		return true
+	}
+}
+
+// webConfig is a configuration structure for webAPI.
+type webConfig struct {
+	// opts are used to determine if update is enabled.
+	opts options
+
+	// clientBuildFS is used for initializing client FS.  If opts.localFrontend
+	// is false, then this field must not be nil.
+	clientBuildFS fs.FS
+
+	// updater is used for handling updates.  It must not be nil.
+	updater *updater.Updater
+
+	// baseLogger is used for logging init process and for logging inside web
+	// api.  It must not be nil.
+	baseLogger *slog.Logger
+
+	// tlsManager contains the current configuration and state of TLS
+	// encryption. It must not be nil.
+	tlsManager aghtls.Manager
+
+	// auth stores web user information and handles authentication.  It must not
+	// be nil.
+	auth *auth
+
+	// mux is the default *http.ServeMux, the same as [globalContext.mux]. It
+	// must not be nil.
+	mux *http.ServeMux
+
+	// hostsContainer is used for DNS initialization on updates.
+	hostsContainer *aghnet.HostsContainer
+
+	// configModifier is used to update the global configuration.
+	configModifier agh.ConfigModifier
+
+	// httpReg registers HTTP handlers. It must not be nil.
+	httpReg aghhttp.Registrar
+
+	// workDir is a base working directory.
+	workDir string
+
+	// confPath is a config path.
+	confPath string
+
+	// pidFilePath is a path to a PID file.
+	pidFilePath string
+
+	// isCustomUpdURL defines if updater should use custom url.
+	isCustomUpdURL bool
+
+	// isFirstRun defines if current run is the first run.
+	isFirstRun bool
+}
+
+// newWeb initializes the web module.  conf must not be nil.
+func newWeb(ctx context.Context, conf *webConfig) (web *webAPI, err error) {
+	logger := conf.baseLogger.With(slogutil.KeyPrefix, "webapi")
+
+	webPort := suggestedWebPort(ctx, logger)
+
+	var clientFS fs.FS
+	if conf.opts.localFrontend {
+		logger.WarnContext(ctx, "using local frontend files")
 
 		clientFS = os.DirFS("build/static")
-		clientBetaFS = os.DirFS("build2/static")
 	} else {
-		clientFS, err = fs.Sub(clientBuildFS, "build/static")
+		clientFS, err = fs.Sub(conf.clientBuildFS, "build/static")
 		if err != nil {
 			return nil, fmt.Errorf("getting embedded client subdir: %w", err)
 		}
-
-		clientBetaFS, err = fs.Sub(clientBuildFS, "build2/static")
-		if err != nil {
-			return nil, fmt.Errorf("getting embedded beta client subdir: %w", err)
-		}
 	}
 
-	webConf := webConfig{
-		firstRun:     Context.firstRun,
-		BindHost:     config.BindHost,
-		BindPort:     config.BindPort,
-		BetaBindPort: config.BetaBindPort,
+	disableUpdate := !isUpdateEnabled(ctx, conf.baseLogger, &conf.opts, conf.isCustomUpdURL)
+
+	webConf := &webAPIConfig{
+		CommandConstructor: executil.SystemCommandConstructor{},
+		updater:            conf.updater,
+		logger:             logger,
+		baseLogger:         conf.baseLogger,
+		confModifier:       conf.configModifier,
+		httpReg:            conf.httpReg,
+		tlsManager:         conf.tlsManager,
+		auth:               conf.auth,
+		mux:                conf.mux,
+		hostsContainer:     conf.hostsContainer,
+
+		clientFS: clientFS,
+
+		BindAddr: config.HTTPConfig.Address,
+
+		workDir:  conf.workDir,
+		confPath: conf.confPath,
 
 		ReadTimeout:       readTimeout,
 		ReadHeaderTimeout: readHdrTimeout,
 		WriteTimeout:      writeTimeout,
 
-		clientFS:     clientFS,
-		clientBetaFS: clientBetaFS,
+		defaultWebPort: webPort,
+		pidFilePath:    conf.pidFilePath,
+
+		firstRun:         conf.isFirstRun,
+		disableUpdate:    disableUpdate,
+		runningAsService: conf.opts.runningAsService,
+		serveHTTP3:       config.DNS.ServeHTTP3,
 	}
 
-	web = CreateWeb(&webConf)
+	web = newWebAPI(ctx, webConf)
 	if web == nil {
-		return nil, fmt.Errorf("initializing web: %w", err)
+		return nil, errors.Error("can not initialize web")
 	}
 
 	return web, nil
 }
 
-func fatalOnError(err error) {
+// suggestedWebPort returns the suggested default HTTP port for the installation
+// wizard, using the port provided via an environment variable.  It falls back
+// to [defaultPortHTTP] on error.
+func suggestedWebPort(ctx context.Context, l *slog.Logger) (p uint16) {
+	const webPortEnv = "ADGUARD_HOME_DEFAULT_WEB_PORT"
+
+	s := os.Getenv(webPortEnv)
+	if s == "" {
+		return defaultPortHTTP
+	}
+
+	v, err := strconv.ParseUint(s, 10, 16)
+	if err == nil && v == 0 {
+		err = errors.ErrOutOfRange
+	}
+
 	if err != nil {
-		log.Fatal(err)
+		l.WarnContext(
+			ctx,
+			"invalid web port; using default",
+			"env", webPortEnv,
+			"val", s,
+			slogutil.KeyError, err,
+		)
+
+		return defaultPortHTTP
+	}
+
+	return uint16(v)
+}
+
+// fatalOnError logs err and exits with a failure exit code if err is not nil.
+// l must not be nil.
+func fatalOnError(ctx context.Context, l *slog.Logger, err error) {
+	if err != nil {
+		l.ErrorContext(ctx, "fatal error", slogutil.KeyError, err)
+
+		os.Exit(osutil.ExitCodeFailure)
 	}
 }
 
-// run performs configurating and starts AdGuard Home.
-func run(args options, clientBuildFS fs.FS) {
-	var err error
+// run configures and starts AdGuard Home.  base and sigHdlr must not be nil.
+// glTokenFileRoot must not be nil if opts.glinetMode is true.  clientBuildFS
+// must not be nil if opts.localFrontend is false.
+//
+// TODO(e.burkov):  Make opts a pointer.
+func run(
+	ctx context.Context,
+	baseLogger *slog.Logger,
+	opts options,
+	clientBuildFS fs.FS,
+	glTokenFileRoot *os.Root,
+	done chan struct{},
+	sigHdlr *signalHandler,
+	workDir string,
+	confPath string,
+	pidFilePath string,
+	hc *aghnet.HostsContainer,
+) {
+	aghtls.Init(ctx, baseLogger.With(slogutil.KeyPrefix, "aghtls"))
 
-	// configure config filename
-	initConfigFilename(args)
+	isFirstRun := detectFirstRun(ctx, baseLogger, workDir, confPath)
 
-	// configure working dir and config path
-	initWorkingDir(args)
+	mw := &webMw{}
+	mux := http.NewServeMux()
+	httpReg := aghhttp.NewDefaultRegistrar(mux, mw.wrap)
 
-	// configure log level and output
-	configureLogger(args)
+	setupContext(ctx, baseLogger, opts, workDir, confPath, isFirstRun)
 
-	// Go memory hacks
-	memoryUsage(args)
+	err := configureOS(ctx, baseLogger, config)
+	fatalOnError(ctx, baseLogger, err)
 
-	// print the first message after logger is configured
-	log.Println(version.Full())
-	log.Debug("Current working directory is %s", Context.workDir)
-	if args.runningAsService {
-		log.Info("AdGuard Home is running as a service")
+	// Clients package uses filtering package's static data
+	// (filtering.BlockedSvcKnown()), so we have to initialize filtering static
+	// data first, but also to avoid relying on automatic Go init() function.
+	filtering.InitModule(ctx, baseLogger)
+
+	confModifier := newDefaultConfigModifier(
+		config,
+		baseLogger.With(slogutil.KeyPrefix, "config_modifier"),
+		workDir,
+		confPath,
+	)
+
+	err = initContextClients(ctx, baseLogger, sigHdlr, confModifier, httpReg, workDir, hc)
+	fatalOnError(ctx, baseLogger, err)
+
+	tlsMgr, err := newTLSManager(ctx, baseLogger, sigHdlr, confModifier)
+	fatalOnError(ctx, baseLogger, err)
+
+	err = setupDNSFilteringConf(
+		ctx,
+		baseLogger,
+		config.Filtering,
+		tlsMgr,
+		confModifier,
+		httpReg,
+		workDir,
+		hc,
+	)
+	fatalOnError(ctx, baseLogger, err)
+
+	err = setupBindOpts(opts)
+	fatalOnError(ctx, baseLogger, err)
+
+	upd, isCustomURL := initUpdate(ctx, baseLogger, opts, tlsMgr, isFirstRun, workDir, confPath)
+
+	dataDirPath := filepath.Join(workDir, dataDir)
+	err = os.MkdirAll(dataDirPath, aghos.DefaultPermDir)
+	fatalOnError(
+		ctx,
+		baseLogger,
+		errors.Annotate(err, "creating dns data dir at %q: %w", dataDirPath),
+	)
+
+	auth, err := initUsers(ctx, baseLogger, workDir, mux, opts.glinetMode, glTokenFileRoot)
+	fatalOnError(ctx, baseLogger, err)
+
+	confModifier.setAuth(auth)
+
+	conf := &webConfig{
+		clientBuildFS:  clientBuildFS,
+		updater:        upd,
+		opts:           opts,
+		baseLogger:     baseLogger,
+		tlsManager:     tlsMgr,
+		auth:           auth,
+		mux:            mux,
+		hostsContainer: hc,
+		configModifier: confModifier,
+		httpReg:        httpReg,
+		workDir:        workDir,
+		confPath:       confPath,
+		pidFilePath:    pidFilePath,
+		isCustomUpdURL: isCustomURL,
+		isFirstRun:     isFirstRun,
 	}
 
-	setupContext(args)
+	web, err := newWeb(ctx, conf)
+	fatalOnError(ctx, baseLogger, err)
 
-	err = configureOS(config)
-	fatalOnError(err)
+	mw.set(web)
 
-	// clients package uses filtering package's static data (filtering.BlockedSvcKnown()),
-	//  so we have to initialize filtering's static data first,
-	//  but also avoid relying on automatic Go init() function
-	filtering.InitModule()
+	sigHdlr.addWeb(web)
 
-	err = setupConfig(args)
-	fatalOnError(err)
+	statsDir, querylogDir, err := checkStatsAndQuerylogDirs(config, workDir)
+	fatalOnError(ctx, baseLogger, err)
 
-	if !Context.firstRun {
-		// Save the updated config
-		err = config.write()
-		fatalOnError(err)
+	if !isFirstRun {
+		runDNSServer(ctx, baseLogger, tlsMgr, confModifier, statsDir, querylogDir, httpReg, hc, web.conf.mux)
+	}
 
-		if config.DebugPProf {
-			mux := http.NewServeMux()
-			mux.HandleFunc("/debug/pprof/", pprof.Index)
-			mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-			mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-			mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-			mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-			go func() {
-				log.Info("pprof: listening on localhost:6060")
-				lerr := http.ListenAndServe("localhost:6060", mux)
-				log.Error("Error while running the pprof server: %s", lerr)
-			}()
+	if !opts.noPermCheck {
+		checkPermissions(ctx, baseLogger, workDir, confPath, dataDirPath, statsDir, querylogDir)
+	}
+
+	web.start(ctx)
+
+	// Wait for other goroutines to complete their job.
+	<-done
+}
+
+// runDNSServer initializes and starts DNS and DHCP servers if this is not the
+// first run.  httpReg, slogLogger, tlsMgr, confModifier, and mux must not be
+// nil.
+func runDNSServer(
+	ctx context.Context,
+	slogLogger *slog.Logger,
+	tlsMgr aghtls.Manager,
+	confModifier *defaultConfigModifier,
+	statsDir string,
+	querylogDir string,
+	httpReg *aghhttp.DefaultRegistrar,
+	hc *aghnet.HostsContainer,
+	mux httputil.Router,
+) {
+	err := initDNS(ctx, slogLogger, tlsMgr, confModifier, httpReg, statsDir, querylogDir, hc, mux)
+	fatalOnError(ctx, slogLogger, err)
+
+	go func() {
+		startErr := startDNSServer(ctx)
+		if startErr != nil {
+			closeDNSServer(ctx, slogLogger)
+			fatalOnError(ctx, slogLogger, startErr)
+		}
+	}()
+
+	if globalContext.dhcpServer != nil {
+		err = globalContext.dhcpServer.Start(ctx)
+		if err != nil {
+			slogLogger.ErrorContext(ctx, "starting dhcp server", slogutil.KeyError, err)
+		}
+	}
+}
+
+// newTLSManager initializes TLS manager.  baseLogger, sigHdlr, and confModifier
+// must not be nil.
+func newTLSManager(
+	ctx context.Context,
+	baseLogger *slog.Logger,
+	sigHdlr *signalHandler,
+	confModifier *defaultConfigModifier,
+) (tlsMgr aghtls.Manager, err error) {
+	tlsMgrLogger := baseLogger.With(slogutil.KeyPrefix, "tls_manager")
+
+	var watcher aghos.FSWatcher
+	watcher, err = aghos.NewOSWatcher(&aghos.OSWatcherConfig{
+		Logger: tlsMgrLogger.With(slogutil.KeyPrefix, "cert_watcher"),
+	})
+	if err != nil {
+		tlsMgrLogger.ErrorContext(ctx, "initializing watcher", slogutil.KeyError, err)
+		watcher = aghos.EmptyFSWatcher{}
+	}
+
+	tlsMgr, err = aghtls.NewDefaultManager(ctx, &aghtls.DefaultManagerConfig{
+		ExtendedTLSConfig: confFromTLSSettings(&config.TLS),
+		ServePlainDNS:     config.DNS.ServePlainDNS,
+		Logger:            baseLogger.With(slogutil.KeyPrefix, "aghtls_manager"),
+		Watcher:           watcher,
+	})
+	if err != nil {
+		tlsMgrLogger.ErrorContext(ctx, "initializing", slogutil.KeyError, err)
+		confModifier.Apply(ctx)
+	}
+
+	err = tlsMgr.Start(ctx)
+	if err != nil {
+		confModifier.Apply(ctx)
+
+		return nil, fmt.Errorf("starting tls manager: %w", err)
+	}
+
+	sigHdlr.addTLSManager(tlsMgr)
+	confModifier.setTLSManager(tlsMgr)
+
+	return tlsMgr, nil
+}
+
+// initUpdate configures and runs update of this application.  logger and tlsMgr
+// must not be nil.
+func initUpdate(
+	ctx context.Context,
+	baseLogger *slog.Logger,
+	opts options,
+	tlsMgr aghtls.Manager,
+	isFirstRun bool,
+	workDir string,
+	confPath string,
+) (upd *updater.Updater, isCustomURL bool) {
+	execPath, err := os.Executable()
+	fatalOnError(ctx, baseLogger, errors.Annotate(err, "getting executable path: %w"))
+
+	updLogger := baseLogger.With(slogutil.KeyPrefix, "updater")
+	upd, isCustomURL = newUpdater(
+		ctx,
+		updLogger,
+		config,
+		workDir,
+		confPath,
+		execPath,
+	)
+
+	// TODO(e.burkov): This could be made earlier, probably as the option's
+	// effect.
+	cmdlineUpdate(ctx, baseLogger, opts, upd, tlsMgr, isFirstRun)
+
+	if !isFirstRun {
+		// Save the updated config.
+		err = config.write(ctx, baseLogger, nil, nil, workDir, confPath)
+		fatalOnError(ctx, baseLogger, err)
+
+		if config.HTTPConfig.Pprof.Enabled {
+			startPprof(baseLogger, config.HTTPConfig.Pprof.Port)
 		}
 	}
 
-	err = os.MkdirAll(Context.getDataDir(), 0o755)
-	if err != nil {
-		log.Fatalf("Cannot create DNS data dir at %s: %s", Context.getDataDir(), err)
+	return upd, isCustomURL
+}
+
+// newUpdater creates a new AdGuard Home updater.  l and conf must not be nil.
+// workDir, confPath, and execPath must not be empty.  isCustomURL is true if
+// the user has specified a custom version announcement URL.
+func newUpdater(
+	ctx context.Context,
+	l *slog.Logger,
+	conf *configuration,
+	workDir string,
+	confPath string,
+	execPath string,
+) (upd *updater.Updater, isCustomURL bool) {
+	// envName is the name of the environment variable that can be used to
+	// override the default version check URL.
+	const envName = "ADGUARD_HOME_TEST_UPDATE_VERSION_URL"
+
+	customURLStr := os.Getenv(envName)
+
+	var versionURL *url.URL
+	switch {
+	case version.Channel() == version.ChannelRelease:
+		// Only enable custom version URL for development builds.
+		l.DebugContext(ctx, "custom version url is disabled for release builds")
+	case !conf.UnsafeUseCustomUpdateIndexURL:
+		l.DebugContext(ctx, "custom version url is disabled in config")
+	default:
+		versionURL, _ = url.Parse(customURLStr)
 	}
 
-	sessFilename := filepath.Join(Context.getDataDir(), "sessions.db")
-	GLMode = args.glinetMode
-	var arl *authRateLimiter
+	err := urlutil.ValidateHTTPURL(versionURL)
+	if isCustomURL = err == nil; !isCustomURL {
+		l.DebugContext(ctx, "parsing custom version url", slogutil.KeyError, err)
+
+		versionURL = updater.DefaultVersionURL()
+	}
+
+	l.DebugContext(ctx, "creating updater", "config_path", confPath)
+
+	return updater.NewUpdater(&updater.Config{
+		Client:             conf.Filtering.HTTPClient,
+		Logger:             l,
+		CommandConstructor: executil.SystemCommandConstructor{},
+		Version:            version.Version(),
+		Channel:            version.Channel(),
+		GOARCH:             runtime.GOARCH,
+		GOOS:               runtime.GOOS,
+		GOARM:              version.GOARM(),
+		GOMIPS:             version.GOMIPS(),
+		WorkDir:            workDir,
+		ConfName:           confPath,
+		ExecPath:           execPath,
+		VersionCheckURL:    versionURL,
+	}), isCustomURL
+}
+
+// checkPermissions checks and migrates permissions of the files and directories
+// used by AdGuard Home, if needed.
+func checkPermissions(
+	ctx context.Context,
+	baseLogger *slog.Logger,
+	workDir string,
+	confPath string,
+	dataDirPath string,
+	statsDir string,
+	querylogDir string,
+) {
+	l := baseLogger.With(slogutil.KeyPrefix, "permcheck")
+
+	if permcheck.NeedsMigration(ctx, l, workDir, confPath) {
+		permcheck.Migrate(ctx, l, workDir, dataDirPath, statsDir, querylogDir, confPath)
+	}
+
+	permcheck.Check(ctx, l, workDir, dataDirPath, statsDir, querylogDir, confPath)
+}
+
+// initUsers initializes authentication module and clears the [config.Users]
+// field.  baseLogger and mux must not be nil.  glTokenRoot must not be nil if
+// isGLiNet is true.
+func initUsers(
+	ctx context.Context,
+	baseLogger *slog.Logger,
+	workDir string,
+	mux *http.ServeMux,
+	isGLiNet bool,
+	glTokenRoot *os.Root,
+) (auth *auth, err error) {
+	var rateLimiter loginRateLimiter
 	if config.AuthAttempts > 0 && config.AuthBlockMin > 0 {
-		arl = newAuthRateLimiter(
-			time.Duration(config.AuthBlockMin)*time.Minute,
-			config.AuthAttempts,
-		)
+		blockDur := time.Duration(config.AuthBlockMin) * time.Minute
+		rateLimiter = newAuthRateLimiter(blockDur, config.AuthAttempts)
 	} else {
-		log.Info("authratelimiter is disabled")
+		baseLogger.WarnContext(ctx, "authratelimiter is disabled")
+		rateLimiter = emptyRateLimiter{}
 	}
 
-	Context.auth = InitAuth(
-		sessFilename,
-		config.Users,
-		config.WebSessionTTLHours*60*60,
-		arl,
-	)
-	if Context.auth == nil {
-		log.Fatalf("Couldn't initialize Auth module")
+	dataDirPath := filepath.Join(workDir, dataDir)
+	auth, err = newAuth(ctx, &authConfig{
+		baseLogger:      baseLogger,
+		mux:             mux,
+		rateLimiter:     rateLimiter,
+		trustedProxies:  netutil.SliceSubnetSet(netutil.UnembedPrefixes(config.DNS.TrustedProxies)),
+		dbFilename:      filepath.Join(dataDirPath, sessionsDBName),
+		doHRoutes:       config.HTTPConfig.DoH.Routes,
+		users:           config.Users,
+		sessionTTL:      time.Duration(config.HTTPConfig.SessionTTL),
+		isGLiNet:        isGLiNet,
+		gliNetTokenRoot: glTokenRoot,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("initializing auth module: %w", err)
 	}
+
 	config.Users = nil
 
-	Context.tls = tlsCreate(config.TLS)
-	if Context.tls == nil {
-		log.Fatalf("Can't initialize TLS module")
-	}
-
-	Context.web, err = initWeb(args, clientBuildFS)
-	fatalOnError(err)
-
-	Context.subnetDetector, err = aghnet.NewSubnetDetector()
-	fatalOnError(err)
-
-	if !Context.firstRun {
-		err = initDNSServer()
-		fatalOnError(err)
-
-		Context.tls.Start()
-
-		go func() {
-			serr := startDNSServer()
-			if serr != nil {
-				closeDNSServer()
-				fatalOnError(serr)
-			}
-		}()
-
-		if Context.dhcpServer != nil {
-			err = Context.dhcpServer.Start()
-			if err != nil {
-				log.Error("starting dhcp server: %s", err)
-			}
-		}
-	}
-
-	Context.web.Start()
-
-	// wait indefinitely for other go-routines to complete their job
-	select {}
+	return auth, nil
 }
 
-// StartMods initializes and starts the DNS server after installation.
-func StartMods() error {
-	err := initDNSServer()
-	if err != nil {
-		return err
+func (c *configuration) anonymizer() (ipmut *aghnet.IPMut) {
+	var anonFunc aghnet.IPMutFunc
+	if c.DNS.AnonymizeClientIP {
+		anonFunc = querylog.AnonymizeIP
 	}
 
-	Context.tls.Start()
-
-	err = startDNSServer()
-	if err != nil {
-		closeDNSServer()
-		return err
-	}
-	return nil
+	return aghnet.NewIPMut(anonFunc)
 }
 
-// Check if the current user permissions are enough to run AdGuard Home
-func checkPermissions() {
-	log.Info("Checking if AdGuard Home has necessary permissions")
-
-	if runtime.GOOS == "windows" {
-		// On Windows we need to have admin rights to run properly
-
-		admin, _ := aghos.HaveAdminRights()
-		if admin {
-			return
-		}
-
-		log.Fatal("This is the first launch of AdGuard Home. You must run it as Administrator.")
-	}
-
-	// We should check if AdGuard Home is able to bind to port 53
-	ok, err := aghnet.CanBindPort(53)
-
-	if ok {
-		log.Info("AdGuard Home can bind to port 53")
-		return
-	}
-
-	if errors.Is(err, os.ErrPermission) {
-		msg := `Permission check failed.
+// permCheckHelp is printed when binding to privileged ports is not permitted.
+const permCheckHelp = `Permission check failed.
 
 AdGuard Home is not allowed to bind to privileged ports (for instance, port 53).
-Please note, that this is crucial for a server to be able to use privileged ports.
+Please note that this is crucial for a server to be able to use privileged ports.
 
 You have two options:
-1. Run AdGuard Home with root privileges
+1. Run AdGuard Home with root privileges.
 2. On Linux you can grant the CAP_NET_BIND_SERVICE capability:
 https://github.com/AdguardTeam/AdGuardHome/wiki/Getting-Started#running-without-superuser`
 
-		log.Fatal(msg)
+// checkNetworkPermissions checks if the current user permissions are enough to
+// use the required networking functionality.  l must not be nil.
+func checkNetworkPermissions(ctx context.Context, l *slog.Logger) {
+	l.InfoContext(ctx, "checking if adguard home has the necessary permissions")
+
+	if ok, err := aghnet.CanBindPrivilegedPorts(ctx, l); !ok || err != nil {
+		l.ErrorContext(
+			ctx,
+			"this is the first launch of adguard home; you must run it as administrator.",
+		)
+
+		os.Exit(osutil.ExitCodeFailure)
 	}
 
-	msg := fmt.Sprintf(`AdGuard failed to bind to port 53 due to %v
+	// We should check if AdGuard Home is able to bind to port 53
+	err := aghnet.CheckPort("tcp", netip.AddrPortFrom(netutil.IPv4Localhost(), defaultPortDNS))
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			slogutil.PrintLines(ctx, l, slog.LevelError, "", permCheckHelp)
 
-Please note, that this is crucial for a DNS server to be able to use that port.`, err)
+			os.Exit(osutil.ExitCodeFailure)
+		}
 
-	log.Info(msg)
+		l.ErrorContext(
+			ctx,
+			"failed to bind to port 53; binding to port 53 is required for a dns server",
+			slogutil.KeyError, err,
+		)
+	}
+
+	l.InfoContext(ctx, "adguard home can bind to port 53")
 }
 
-// Write PID to a file
-func writePIDFile(fn string) bool {
+// writePIDFile writes the PID of the current process to the file at fn.  l
+// must not be nil.
+func writePIDFile(ctx context.Context, l *slog.Logger, fn string) (ok bool) {
 	data := fmt.Sprintf("%d", os.Getpid())
 	err := os.WriteFile(fn, []byte(data), 0o644)
 	if err != nil {
-		log.Error("Couldn't write PID to file %s: %v", fn, err)
+		l.ErrorContext(ctx, "writing pid file", "path", fn, slogutil.KeyError, err)
+
 		return false
 	}
+
 	return true
 }
 
-func initConfigFilename(args options) {
-	// config file path can be overridden by command-line arguments:
-	if args.configFilename != "" {
-		Context.configFilename = args.configFilename
+// initConfigFilename returns the configuration file path.  If a path is
+// provided via command-line argument, it is used; otherwise a default within
+// workDir is returned.  l must not be nil.
+func initConfigFilename(
+	ctx context.Context,
+	l *slog.Logger,
+	opts options,
+	workDir string,
+) (confPath string) {
+	confPath = opts.confFilename
+	if confPath != "" {
+		l.DebugContext(ctx, "config path overridden from cmdline", "path", confPath)
+
+		return confPath
+	}
+
+	confPath = filepath.Join(workDir, "AdGuardHome.yaml")
+
+	return confPath
+}
+
+// initWorkingDir returns the working directory path.  If no command-line
+// argument is provided, it uses the executable's directory.
+func initWorkingDir(opts options) (workDir string, err error) {
+	if opts.workDir != "" {
+		workDir = opts.workDir
 	} else {
-		// Default config file name
-		Context.configFilename = "AdGuardHome.yaml"
-	}
-}
-
-// initWorkingDir initializes the workDir
-// if no command-line arguments specified, we use the directory where our binary file is located
-func initWorkingDir(args options) {
-	execPath, err := os.Executable()
-	if err != nil {
-		panic(err)
-	}
-
-	if args.workDir != "" {
-		// If there is a custom config file, use it's directory as our working dir
-		Context.workDir = args.workDir
-	} else {
-		Context.workDir = filepath.Dir(execPath)
-	}
-
-	workDir, err := filepath.EvalSymlinks(Context.workDir)
-	if err != nil {
-		panic(err)
-	}
-
-	Context.workDir = workDir
-}
-
-// configureLogger configures logger level and output
-func configureLogger(args options) {
-	ls := getLogSettings()
-
-	// command-line arguments can override config settings
-	if args.verbose || config.Verbose {
-		ls.Verbose = true
-	}
-	if args.logFile != "" {
-		ls.LogFile = args.logFile
-	} else if config.LogFile != "" {
-		ls.LogFile = config.LogFile
-	}
-
-	// Handle default log settings overrides
-	ls.LogCompress = config.LogCompress
-	ls.LogLocalTime = config.LogLocalTime
-	ls.LogMaxBackups = config.LogMaxBackups
-	ls.LogMaxSize = config.LogMaxSize
-	ls.LogMaxAge = config.LogMaxAge
-
-	// log.SetLevel(log.INFO) - default
-	if ls.Verbose {
-		log.SetLevel(log.DEBUG)
-	}
-
-	// Make sure that we see the microseconds in logs, as networking stuff
-	// can happen pretty quickly.
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-
-	if args.runningAsService && ls.LogFile == "" && runtime.GOOS == "windows" {
-		// When running as a Windows service, use eventlog by default if nothing else is configured
-		// Otherwise, we'll simply loose the log output
-		ls.LogFile = configSyslog
-	}
-
-	// logs are written to stdout (default)
-	if ls.LogFile == "" {
-		return
-	}
-
-	if ls.LogFile == configSyslog {
-		// Use syslog where it is possible and eventlog on Windows
-		err := aghos.ConfigureSyslog(serviceName)
+		var execPath string
+		execPath, err = os.Executable()
 		if err != nil {
-			log.Fatalf("cannot initialize syslog: %s", err)
-		}
-	} else {
-		logFilePath := filepath.Join(Context.workDir, ls.LogFile)
-		if filepath.IsAbs(ls.LogFile) {
-			logFilePath = ls.LogFile
+			// Don't wrap the error, because it's informative enough as is.
+			return "", err
 		}
 
-		_, err := os.OpenFile(logFilePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
-		if err != nil {
-			log.Fatalf("cannot create a log file: %s", err)
-		}
-
-		log.SetOutput(&lumberjack.Logger{
-			Filename:   logFilePath,
-			Compress:   ls.LogCompress, // disabled by default
-			LocalTime:  ls.LogLocalTime,
-			MaxBackups: ls.LogMaxBackups,
-			MaxSize:    ls.LogMaxSize, // megabytes
-			MaxAge:     ls.LogMaxAge,  // days
-		})
-	}
-}
-
-// cleanup stops and resets all the modules.
-func cleanup(ctx context.Context) {
-	log.Info("stopping AdGuard Home")
-
-	if Context.web != nil {
-		Context.web.Close(ctx)
-		Context.web = nil
-	}
-	if Context.auth != nil {
-		Context.auth.Close()
-		Context.auth = nil
+		workDir = filepath.Dir(execPath)
 	}
 
-	err := stopDNSServer()
+	workDir, err = filepath.EvalSymlinks(workDir)
 	if err != nil {
-		log.Error("stopping dns server: %s", err)
+		// Don't wrap the error, because it's informative enough as is.
+		return "", err
 	}
 
-	if Context.dhcpServer != nil {
-		err = Context.dhcpServer.Stop()
+	return workDir, nil
+}
+
+// cleanup stops and resets all the modules.  l must not be nil.
+//
+// TODO(m.kazantsev):  Consider making it a method of [signalHandler].
+func cleanup(ctx context.Context, l *slog.Logger, hc *aghnet.HostsContainer) {
+	l.InfoContext(ctx, "stopping adguard home")
+
+	err := stopDNSServer(ctx, l)
+	if err != nil {
+		l.ErrorContext(ctx, "stopping dns server", slogutil.KeyError, err)
+	}
+
+	if globalContext.dhcpServer != nil {
+		err = globalContext.dhcpServer.Stop()
 		if err != nil {
-			log.Error("stopping dhcp server: %s", err)
+			l.ErrorContext(ctx, "stopping dhcp server", slogutil.KeyError, err)
 		}
 	}
 
-	if Context.etcHosts != nil {
-		// Currently Context.hostsWatcher is only used in Context.etcHosts and
-		// needs closing only in case of the successful initialization of
-		// Context.etcHosts.
-		if err = Context.hostsWatcher.Close(); err != nil {
-			log.Error("closing hosts watcher: %s", err)
+	if hc != nil {
+		if err = hc.Close(); err != nil {
+			l.ErrorContext(ctx, "closing hosts container", slogutil.KeyError, err)
 		}
-
-		if err = Context.etcHosts.Close(); err != nil {
-			log.Error("closing hosts container: %s", err)
-		}
-	}
-
-	if Context.tls != nil {
-		Context.tls.Close()
-		Context.tls = nil
 	}
 }
 
-// This function is called before application exits
-func cleanupAlways() {
-	if len(Context.pidFileName) != 0 {
-		_ = os.Remove(Context.pidFileName)
+// cleanupAlways is called on application exit.  l must not be nil.
+func cleanupAlways(ctx context.Context, l *slog.Logger, pidFilePath string) {
+	if pidFilePath != "" {
+		err := os.Remove(pidFilePath)
+		if err != nil {
+			l.ErrorContext(ctx, "removing pid file", slogutil.KeyError, err)
+		}
 	}
-	log.Info("Stopped")
+
+	l.InfoContext(ctx, "stopped")
 }
 
 func exitWithError() {
 	os.Exit(64)
 }
 
-// loadOptions reads command line arguments and initializes configuration
-func loadOptions() options {
-	o, f, err := parse(os.Args[0], os.Args[1:])
-
+// loadCmdLineOpts reads command line arguments and initializes configuration
+// from them.  If there is an error or an effect, loadCmdLineOpts processes them
+// and exits.
+//
+// TODO(m.kazantsev):  Consider refactoring the logs so that it
+// resembles AdGuard DNS CLI.
+func loadCmdLineOpts() (opts options) {
+	opts, eff, err := parseCmdOpts(os.Args[0], os.Args[1:])
 	if err != nil {
-		log.Error(err.Error())
-		_ = printHelp(os.Args[0])
+		log.Printf("error: %s\n", err)
+		printHelp(os.Args[0])
+
 		exitWithError()
-	} else if f != nil {
-		err = f()
-		if err != nil {
-			log.Error(err.Error())
-			exitWithError()
-		} else {
-			os.Exit(0)
-		}
 	}
 
-	return o
+	if eff != nil {
+		err = eff()
+		if err != nil {
+			log.Printf("error: %s\n", err)
+			exitWithError()
+		}
+
+		os.Exit(osutil.ExitCodeSuccess)
+	}
+
+	return opts
 }
 
 // printWebAddrs prints addresses built from proto, addr, and an appropriate
-// port.  At least one address is printed with the value of port.  If the value
-// of betaPort is 0, the second address is not printed.  The output example:
+// port.  At least one address is printed with the value of port.  l must not be
+// nil.  Output example:
 //
-//   Go to http://127.0.0.1:80
-//   Go to http://127.0.0.1:3000 (BETA)
-//
-func printWebAddrs(proto, addr string, port, betaPort int) {
-	const (
-		hostMsg     = "Go to %s://%s"
-		hostBetaMsg = hostMsg + " (BETA)"
-	)
-
-	log.Printf(hostMsg, proto, netutil.JoinHostPort(addr, port))
-	if betaPort == 0 {
-		return
+//	2026/04/08 14:01:43.794575 56031#1 [info] serving url=http://127.0.0.1:3000
+func printWebAddrs(ctx context.Context, l *slog.Logger, proto, addr string, port uint16) {
+	u := &url.URL{
+		Scheme: proto,
+		Host:   netutil.JoinHostPort(addr, port),
 	}
 
-	log.Printf(hostBetaMsg, proto, netutil.JoinHostPort(addr, config.BetaBindPort))
+	l.InfoContext(ctx, "serving", "url", u.String())
 }
 
 // printHTTPAddresses prints the IP addresses which user can use to access the
-// admin interface.  proto is either schemeHTTP or schemeHTTPS.
-func printHTTPAddresses(proto string) {
-	tlsConf := tlsConfigSettings{}
-	if Context.tls != nil {
-		Context.tls.WriteDiskConfig(&tlsConf)
-	}
+// admin interface over HTTP.  l must not be nil.
+func printHTTPAddresses(ctx context.Context, l *slog.Logger) {
+	port := config.HTTPConfig.Address.Port()
 
-	port := config.BindPort
-	if proto == schemeHTTPS {
-		port = tlsConf.PortHTTPS
-	}
+	printWebInterfaces(ctx, l, urlutil.SchemeHTTP, port)
+}
 
-	// TODO(e.burkov): Inspect and perhaps merge with the previous condition.
-	if proto == schemeHTTPS && tlsConf.ServerName != "" {
-		printWebAddrs(proto, tlsConf.ServerName, tlsConf.PortHTTPS, 0)
+// printHTTPSAddresses prints the IP addresses which user can use to access the
+// admin interface over HTTPS.  l and extTLSConf must not be nil.
+func printHTTPSAddresses(ctx context.Context, l *slog.Logger, extTLSConf *aghtls.ExtendedTLSConfig) {
+	port := extTLSConf.PortHTTPS
+
+	if extTLSConf.ServerName != "" {
+		printWebAddrs(ctx, l, urlutil.SchemeHTTPS, extTLSConf.ServerName, extTLSConf.PortHTTPS)
 
 		return
 	}
 
-	bindhost := config.BindHost
-	if !bindhost.IsUnspecified() {
-		printWebAddrs(proto, bindhost.String(), port, config.BetaBindPort)
+	printWebInterfaces(ctx, l, urlutil.SchemeHTTPS, port)
+}
+
+// printWebInterfaces prints the web interface addresses for the given proto and
+// port.  proto must be either [urlutil.SchemeHTTPS] or [urlutil.SchemeHTTP].
+// l must not be nil.
+func printWebInterfaces(ctx context.Context, l *slog.Logger, proto string, port uint16) {
+	bindHost := config.HTTPConfig.Address.Addr()
+	if !bindHost.IsUnspecified() {
+		printWebAddrs(ctx, l, proto, bindHost.String(), port)
 
 		return
 	}
 
 	ifaces, err := aghnet.GetValidNetInterfacesForWeb()
 	if err != nil {
-		log.Error("web: getting iface ips: %s", err)
+		l.ErrorContext(ctx, "web: getting iface ips", slogutil.KeyError, err)
 		// That's weird, but we'll ignore it.
 		//
 		// TODO(e.burkov): Find out when it happens.
-		printWebAddrs(proto, bindhost.String(), port, config.BetaBindPort)
+		printWebAddrs(ctx, l, proto, bindHost.String(), port)
 
 		return
 	}
 
 	for _, iface := range ifaces {
 		for _, addr := range iface.Addresses {
-			printWebAddrs(proto, addr.String(), config.BindPort, config.BetaBindPort)
+			printWebAddrs(ctx, l, proto, addr.String(), port)
 		}
 	}
 }
 
-// -------------------
-// first run / install
-// -------------------
-func detectFirstRun() bool {
-	configfile := Context.configFilename
-	if !filepath.IsAbs(configfile) {
-		configfile = filepath.Join(Context.workDir, Context.configFilename)
-	}
-	_, err := os.Stat(configfile)
-	return errors.Is(err, os.ErrNotExist)
-}
-
-// Connect to a remote server resolving hostname using our own DNS server.
-//
-// TODO(e.burkov): This messy logic should be decomposed and clarified.
-func customDialContext(ctx context.Context, network, addr string) (conn net.Conn, err error) {
-	log.Tracef("network:%v  addr:%v", network, addr)
-
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return nil, err
+// detectFirstRun returns true if this is the first run of AdGuard Home.  l must
+// not be nil.
+func detectFirstRun(ctx context.Context, l *slog.Logger, workDir, confPath string) (ok bool) {
+	if !filepath.IsAbs(confPath) {
+		confPath = filepath.Join(workDir, confPath)
 	}
 
-	dialer := &net.Dialer{
-		Timeout: time.Minute * 5,
+	_, err := os.Stat(confPath)
+	if err == nil {
+		return false
+	} else if errors.Is(err, os.ErrNotExist) {
+		return true
 	}
 
-	if net.ParseIP(host) != nil || config.DNS.Port == 0 {
-		return dialer.DialContext(ctx, network, addr)
-	}
+	l.ErrorContext(ctx, "failed to detect first run; considering first run", slogutil.KeyError, err)
 
-	addrs, err := Context.dnsServer.Resolve(host)
-	log.Debug("dnsServer.Resolve: %s: %v", host, addrs)
-	if err != nil {
-		return nil, err
-	}
-
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("couldn't lookup host: %s", host)
-	}
-
-	var dialErrs []error
-	for _, a := range addrs {
-		addr = net.JoinHostPort(a.String(), port)
-		conn, err = dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			dialErrs = append(dialErrs, err)
-
-			continue
-		}
-
-		return conn, err
-	}
-
-	return nil, errors.List(fmt.Sprintf("couldn't dial to %s", addr), dialErrs...)
-}
-
-func getHTTPProxy(_ *http.Request) (*url.URL, error) {
-	if config.ProxyURL == "" {
-		return nil, nil
-	}
-
-	return url.Parse(config.ProxyURL)
+	return true
 }
 
 // jsonError is a generic JSON error response.
 //
-// TODO(a.garipov): Merge together with the implementations in .../dhcpd and
-// other packages after refactoring the web handler registering.
+// TODO(a.garipov): Merge together with the implementations in [dhcpd] and other
+// packages after refactoring the web handler registering.
 type jsonError struct {
 	// Message is the error message, an opaque string.
 	Message string `json:"message"`
+}
+
+// cmdlineUpdate updates current application and exits.  l, upd, and tlsMgr must
+// not be nil.
+func cmdlineUpdate(
+	ctx context.Context,
+	l *slog.Logger,
+	opts options,
+	upd *updater.Updater,
+	tlsMgr aghtls.Manager,
+	isFirstRun bool,
+) {
+	if !opts.performUpdate {
+		return
+	}
+
+	// Initialize the DNS server to use the internal resolver which the updater
+	// needs to be able to resolve the update source hostname.
+	//
+	// TODO(e.burkov):  We could probably initialize the internal resolver
+	// separately.
+	err := initDNSServer(
+		ctx,
+		dnsforward.DNSCreateParams{
+			Logger:     l,
+			TLSManager: tlsMgr,
+		},
+		nil,
+		agh.EmptyConfigModifier{},
+	)
+	fatalOnError(ctx, l, err)
+
+	l.InfoContext(ctx, "performing update via cli")
+
+	info, err := upd.VersionInfo(ctx, true)
+	if err != nil {
+		l.ErrorContext(ctx, "getting version info", slogutil.KeyError, err)
+
+		os.Exit(osutil.ExitCodeFailure)
+	}
+
+	if info.NewVersion == version.Version() {
+		l.InfoContext(ctx, "no updates available")
+
+		os.Exit(osutil.ExitCodeSuccess)
+	}
+
+	err = upd.Update(ctx, isFirstRun)
+	fatalOnError(ctx, l, err)
+
+	err = restartService(ctx, l)
+	if err != nil {
+		l.DebugContext(ctx, "restarting service", slogutil.KeyError, err)
+		l.InfoContext(ctx, "AdGuard Home was not installed as a service. "+
+			"Please restart running instances of AdGuardHome manually.")
+	}
+
+	os.Exit(osutil.ExitCodeSuccess)
 }

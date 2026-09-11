@@ -1,62 +1,32 @@
 package aghnet
 
 import (
-	"net"
-	"strconv"
+	"net/netip"
+	"strings"
 )
-
-// The maximum lengths of generated hostnames for different IP versions.
-const (
-	ipv4HostnameMaxLen = len("192-168-100-100")
-	ipv6HostnameMaxLen = len("ff80-f076-0000-0000-0000-0000-0000-0010")
-)
-
-// generateIPv4Hostname generates the hostname for specific IP version.
-func generateIPv4Hostname(ipv4 net.IP) (hostname string) {
-	hnData := make([]byte, 0, ipv4HostnameMaxLen)
-	for i, part := range ipv4 {
-		if i > 0 {
-			hnData = append(hnData, '-')
-		}
-		hnData = strconv.AppendUint(hnData, uint64(part), 10)
-	}
-
-	return string(hnData)
-}
-
-// generateIPv6Hostname generates the hostname for specific IP version.
-func generateIPv6Hostname(ipv6 net.IP) (hostname string) {
-	hnData := make([]byte, 0, ipv6HostnameMaxLen)
-	for i, partsNum := 0, net.IPv6len/2; i < partsNum; i++ {
-		if i > 0 {
-			hnData = append(hnData, '-')
-		}
-		for _, val := range ipv6[i*2 : i*2+2] {
-			if val < 10 {
-				hnData = append(hnData, '0')
-			}
-			hnData = strconv.AppendUint(hnData, uint64(val), 16)
-		}
-	}
-
-	return string(hnData)
-}
 
 // GenerateHostname generates the hostname from ip.  In case of using IPv4 the
 // result should be like:
 //
-//   192-168-10-1
+//	192-168-10-1
 //
 // In case of using IPv6, the result is like:
 //
-//   ff80-f076-0000-0000-0000-0000-0000-0010
+//	ff80-f076-0000-0000-0000-0000-0000-0010
 //
-func GenerateHostname(ip net.IP) (hostname string) {
-	if ipv4 := ip.To4(); ipv4 != nil {
-		return generateIPv4Hostname(ipv4)
-	} else if ipv6 := ip.To16(); ipv6 != nil {
-		return generateIPv6Hostname(ipv6)
+// ip must be either an IPv4 or an IPv6.
+func GenerateHostname(ip netip.Addr) (hostname string) {
+	if !ip.IsValid() {
+		// TODO(s.chzhen):  Get rid of it.
+		panic("aghnet generate hostname: invalid ip")
 	}
 
-	return ""
+	ip = ip.Unmap()
+	hostname = ip.StringExpanded()
+
+	if ip.Is4() {
+		return strings.ReplaceAll(hostname, ".", "-")
+	}
+
+	return strings.ReplaceAll(hostname, ":", "-")
 }

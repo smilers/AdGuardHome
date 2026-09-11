@@ -5,37 +5,65 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
+	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"time"
+	"unicode/utf8"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
+	"github.com/AdguardTeam/AdGuardHome/internal/version"
+	"github.com/AdguardTeam/golibs/container"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
+	"github.com/quic-go/quic-go/http3"
 )
 
 // getAddrsResponse is the response for /install/get_addresses endpoint.
 type getAddrsResponse struct {
-	WebPort    int                             `json:"web_port"`
-	DNSPort    int                             `json:"dns_port"`
 	Interfaces map[string]*aghnet.NetInterface `json:"interfaces"`
+
+	// Version is the version of AdGuard Home.
+	//
+	// TODO(a.garipov): In the new API, rename this endpoint to something more
+	// general, since there will be more information here than just network
+	// interfaces.
+	Version string `json:"version"`
+
+	WebPort int `json:"web_port"`
+	DNSPort int `json:"dns_port"`
 }
 
 // handleInstallGetAddresses is the handler for /install/get_addresses endpoint.
-func (web *Web) handleInstallGetAddresses(w http.ResponseWriter, r *http.Request) {
-	data := getAddrsResponse{}
-	data.WebPort = defaultPortHTTP
-	data.DNSPort = defaultPortDNS
+func (web *webAPI) handleInstallGetAddresses(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := web.logger
+
+	data := getAddrsResponse{
+		Version: version.Version(),
+
+		WebPort: int(web.conf.defaultWebPort),
+		DNSPort: int(defaultPortDNS),
+	}
 
 	ifaces, err := aghnet.GetValidNetInterfacesForWeb()
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "Couldn't get interfaces: %s", err)
+		aghhttp.ErrorAndLog(
+			ctx,
+			l,
+			r,
+			w,
+			http.StatusInternalServerError,
+			"Couldn't get interfaces: %s",
+			err,
+		)
 
 		return
 	}
@@ -45,34 +73,25 @@ func (web *Web) handleInstallGetAddresses(w http.ResponseWriter, r *http.Request
 		data.Interfaces[iface.Name] = iface
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(data)
-	if err != nil {
-		aghhttp.Error(
-			r,
-			w,
-			http.StatusInternalServerError,
-			"Unable to marshal default addresses to json: %s",
-			err,
-		)
-
-		return
-	}
+	aghhttp.WriteJSONResponseOK(ctx, l, w, r, data)
 }
 
-type checkConfigReqEnt struct {
-	Port    int    `json:"port"`
-	IP      net.IP `json:"ip"`
-	Autofix bool   `json:"autofix"`
+type checkConfReqEnt struct {
+	IP      netip.Addr `json:"ip"`
+	Port    uint16     `json:"port"`
+	Autofix bool       `json:"autofix"`
 }
 
-type checkConfigReq struct {
-	Web         checkConfigReqEnt `json:"web"`
-	DNS         checkConfigReqEnt `json:"dns"`
-	SetStaticIP bool              `json:"set_static_ip"`
+type checkConfReq struct {
+	Web checkConfReqEnt `json:"web"`
+	DNS checkConfReqEnt `json:"dns"`
+
+	Language string `json:"language"`
+
+	SetStaticIP bool `json:"set_static_ip"`
 }
 
-type checkConfigRespEnt struct {
+type checkConfRespEnt struct {
 	Status     string `json:"status"`
 	CanAutofix bool   `json:"can_autofix"`
 }
@@ -83,139 +102,210 @@ type staticIPJSON struct {
 	Error  string `json:"error"`
 }
 
-type checkConfigResp struct {
-	Web      checkConfigRespEnt `json:"web"`
-	DNS      checkConfigRespEnt `json:"dns"`
-	StaticIP staticIPJSON       `json:"static_ip"`
+type checkConfResp struct {
+	StaticIP staticIPJSON     `json:"static_ip"`
+	DNS      checkConfRespEnt `json:"dns"`
+	Language checkConfRespEnt `json:"language"`
+	Web      checkConfRespEnt `json:"web"`
 }
 
-// Check if ports are available, respond with results
-func (web *Web) handleInstallCheckConfig(w http.ResponseWriter, r *http.Request) {
-	reqData := checkConfigReq{}
-	respData := checkConfigResp{}
+// validateWeb returns error is the web part if the initial configuration can't
+// be set.
+func (req *checkConfReq) validateWeb(tcpPorts aghalg.UniqChecker[tcpPort]) (err error) {
+	defer func() { err = errors.Annotate(err, "validating ports: %w") }()
 
-	err := json.NewDecoder(r.Body).Decode(&reqData)
+	// TODO(a.garipov): Declare all port variables anywhere as uint16.
+	reqPort := req.Web.Port
+	port := tcpPort(reqPort)
+	addPorts(tcpPorts, port)
+	if err = tcpPorts.Validate(); err != nil {
+		// Reset the value for the port to 1 to make sure that validateDNS
+		// doesn't throw the same error, unless the same TCP port is set there
+		// as well.
+		tcpPorts[port] = 1
+
+		return err
+	}
+
+	switch reqPort {
+	case 0, config.HTTPConfig.Address.Port():
+		return nil
+	default:
+		// Go on and check the port binding only if it's not zero or won't be
+		// unbound after install.
+	}
+
+	return aghnet.CheckPort("tcp", netip.AddrPortFrom(req.Web.IP, reqPort))
+}
+
+// validateDNS returns error if the DNS part of the initial configuration can't
+// be set.  canAutofix is true if the port can be unbound by AdGuard Home
+// automatically.  cmdCons must not be nil.
+func (req *checkConfReq) validateDNS(
+	ctx context.Context,
+	l *slog.Logger,
+	tcpPorts aghalg.UniqChecker[tcpPort],
+	cmdCons executil.CommandConstructor,
+) (canAutofix bool, err error) {
+	defer func() { err = errors.Annotate(err, "validating ports: %w") }()
+
+	port := req.DNS.Port
+	switch port {
+	case 0:
+		return false, nil
+	case config.HTTPConfig.Address.Port():
+		// Go on and only check the UDP port since the TCP one is already bound
+		// by AdGuard Home for web interface.
+	default:
+		// Check TCP as well.
+		addPorts(tcpPorts, tcpPort(port))
+		if err = tcpPorts.Validate(); err != nil {
+			return false, err
+		}
+
+		err = aghnet.CheckPort("tcp", netip.AddrPortFrom(req.DNS.IP, port))
+		if err != nil {
+			return false, err
+		}
+	}
+
+	err = aghnet.CheckPort("udp", netip.AddrPortFrom(req.DNS.IP, port))
+	if !aghnet.IsAddrInUse(err) {
+		return false, err
+	}
+
+	// Try to fix automatically.
+	canAutofix = checkDNSStubListener(ctx, l, cmdCons)
+	if canAutofix && req.DNS.Autofix {
+		if derr := disableDNSStubListener(ctx, l, cmdCons); derr != nil {
+			l.ErrorContext(ctx, "disabling DNSStubListener", slogutil.KeyError, derr)
+		}
+
+		err = aghnet.CheckPort("udp", netip.AddrPortFrom(req.DNS.IP, port))
+		canAutofix = false
+	}
+
+	return canAutofix, err
+}
+
+// handleInstallCheckConfig handles the /check_config endpoint.
+func (web *webAPI) handleInstallCheckConfig(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := web.logger
+
+	req := &checkConfReq{}
+
+	err := json.NewDecoder(r.Body).Decode(req)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "Failed to parse 'check_config' JSON data: %s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "decoding the request: %s", err)
 
 		return
 	}
 
-	pm := portsMap{}
-	pm.add(config.BindPort, config.BetaBindPort, reqData.Web.Port)
-	if err = pm.validate(); err != nil {
-		respData.Web.Status = err.Error()
-	} else if reqData.Web.Port != 0 {
-		err = aghnet.CheckPort("tcp", reqData.Web.IP, reqData.Web.Port)
-		if err != nil {
-			respData.Web.Status = err.Error()
-		}
-	}
+	resp := &checkConfResp{}
 
-	pm.add(reqData.DNS.Port)
-	if err = pm.validate(); err != nil {
-		respData.DNS.Status = err.Error()
-	} else if reqData.DNS.Port != 0 {
-		err = aghnet.CheckPort("udp", reqData.DNS.IP, reqData.DNS.Port)
-
-		if aghnet.IsAddrInUse(err) {
-			canAutofix := checkDNSStubListener()
-			if canAutofix && reqData.DNS.Autofix {
-
-				err = disableDNSStubListener()
-				if err != nil {
-					log.Error("Couldn't disable DNSStubListener: %s", err)
-				}
-
-				err = aghnet.CheckPort("udp", reqData.DNS.IP, reqData.DNS.Port)
-				canAutofix = false
-			}
-
-			respData.DNS.CanAutofix = canAutofix
-		}
-
-		if err == nil {
-			err = aghnet.CheckPort("tcp", reqData.DNS.IP, reqData.DNS.Port)
-		}
-
-		if err != nil {
-			respData.DNS.Status = err.Error()
-		} else if !reqData.DNS.IP.IsUnspecified() {
-			respData.StaticIP = handleStaticIP(reqData.DNS.IP, reqData.SetStaticIP)
-		}
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(respData)
+	err = validateLang(req.Language, true)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "Unable to marshal JSON: %s", err)
-
-		return
+		resp.Language.Status = err.Error()
 	}
+
+	tcpPorts := aghalg.UniqChecker[tcpPort]{}
+	if err = req.validateWeb(tcpPorts); err != nil {
+		resp.Web.Status = err.Error()
+	}
+
+	resp.DNS.CanAutofix, err = req.validateDNS(ctx, l, tcpPorts, web.cmdCons)
+	if err != nil {
+		resp.DNS.Status = err.Error()
+	} else if !req.DNS.IP.IsUnspecified() {
+		resp.StaticIP = handleStaticIP(ctx, l, req.DNS.IP, req.SetStaticIP, web.cmdCons)
+	}
+
+	aghhttp.WriteJSONResponseOK(ctx, l, w, r, resp)
 }
 
-// handleStaticIP - handles static IP request
-// It either checks if we have a static IP
-// Or if set=true, it tries to set it
-func handleStaticIP(ip net.IP, set bool) staticIPJSON {
-	resp := staticIPJSON{}
+// handleStaticIP checks and optionally sets a static IP on the interface that
+// owns IP.  cmdCons must not be nil.
+func handleStaticIP(
+	ctx context.Context,
+	l *slog.Logger,
+	ip netip.Addr,
+	set bool,
+	cmdCons executil.CommandConstructor,
+) (ipResp staticIPJSON) {
+	interfaceName := aghnet.InterfaceByIP(ip)
+	ipResp.Static = "no"
 
-	interfaceName := aghnet.GetInterfaceByIP(ip)
-	resp.Static = "no"
+	if interfaceName == "" {
+		ipResp.Static = "error"
+		ipResp.Error = fmt.Sprintf("Couldn't find network interface by IP %s", ip)
 
-	if len(interfaceName) == 0 {
-		resp.Static = "error"
-		resp.Error = fmt.Sprintf("Couldn't find network interface by IP %s", ip)
-		return resp
+		return ipResp
 	}
 
 	if set {
-		// Try to set static IP for the specified interface
-		err := aghnet.IfaceSetStaticIP(interfaceName)
+		// Try to set a static IP for the specified interface.
+		err := aghnet.IfaceSetStaticIP(ctx, l, cmdCons, interfaceName)
 		if err != nil {
-			resp.Static = "error"
-			resp.Error = err.Error()
-			return resp
+			ipResp.Static = "error"
+			ipResp.Error = err.Error()
+
+			return ipResp
 		}
 	}
 
-	// Fallthrough here even if we set static IP
-	// Check if we have a static IP and return the details
-	isStaticIP, err := aghnet.IfaceHasStaticIP(interfaceName)
+	// Fall through even if we just set the static IP.  Check whether the
+	// interface has a static IP and return the details.
+	isStaticIP, err := aghnet.IfaceHasStaticIP(ctx, cmdCons, interfaceName)
 	if err != nil {
-		resp.Static = "error"
-		resp.Error = err.Error()
-	} else {
-		if isStaticIP {
-			resp.Static = "yes"
-		}
-		resp.IP = aghnet.GetSubnet(interfaceName).String()
+		ipResp.Static = "error"
+		ipResp.Error = err.Error()
+
+		return ipResp
 	}
-	return resp
+
+	if isStaticIP {
+		ipResp.Static = "yes"
+	}
+	ipResp.IP = aghnet.GetSubnet(ctx, l, interfaceName).String()
+
+	return ipResp
 }
 
-// Check if DNSStubListener is active
-func checkDNSStubListener() bool {
+// checkDNSStubListener returns true if DNSStubListener is active.  l and
+// cmdCons must not be nil.
+func checkDNSStubListener(
+	ctx context.Context,
+	l *slog.Logger,
+	cmdCons executil.CommandConstructor,
+) (ok bool) {
 	if runtime.GOOS != "linux" {
 		return false
 	}
 
-	cmd := exec.Command("systemctl", "is-enabled", "systemd-resolved")
-	log.Tracef("executing %s %v", cmd.Path, cmd.Args)
-	_, err := cmd.Output()
-	if err != nil || cmd.ProcessState.ExitCode() != 0 {
-		log.Info("command %s has failed: %v code:%d",
-			cmd.Path, err, cmd.ProcessState.ExitCode())
-		return false
-	}
+	cmds := container.KeyValues[string, []string]{{
+		Key:   "systemctl",
+		Value: []string{"is-enabled", "systemd-resolved"},
+	}, {
+		Key:   "grep",
+		Value: []string{"-E", "#?DNSStubListener=yes", "/etc/systemd/resolved.conf"},
+	}}
 
-	cmd = exec.Command("grep", "-E", "#?DNSStubListener=yes", "/etc/systemd/resolved.conf")
-	log.Tracef("executing %s %v", cmd.Path, cmd.Args)
-	_, err = cmd.Output()
-	if err != nil || cmd.ProcessState.ExitCode() != 0 {
-		log.Info("command %s has failed: %v code:%d",
-			cmd.Path, err, cmd.ProcessState.ExitCode())
-		return false
+	for _, cmd := range cmds {
+		l.DebugContext(ctx, "executing", "cmd", cmd.Key, "args", cmd.Value)
+
+		err := executil.RunWithPeek(
+			ctx,
+			cmdCons,
+			aghos.MaxCmdOutputSize,
+			cmd.Key,
+			cmd.Value...,
+		)
+		if err != nil {
+			l.InfoContext(ctx, "execution failed", "cmd", cmd.Key, slogutil.KeyError, err)
+
+			return false
+		}
 	}
 
 	return true
@@ -230,10 +320,15 @@ DNSStubListener=no
 )
 const resolvConfPath = "/etc/resolv.conf"
 
-// Deactivate DNSStubListener
-func disableDNSStubListener() error {
+// disableDNSStubListener deactivates DNSStubListerner and returns an error, if
+// any.  cmdCons must not be nil.
+func disableDNSStubListener(
+	ctx context.Context,
+	l *slog.Logger,
+	cmdCons executil.CommandConstructor,
+) (err error) {
 	dir := filepath.Dir(resolvedConfPath)
-	err := os.MkdirAll(dir, 0o755)
+	err = os.MkdirAll(dir, 0o755)
 	if err != nil {
 		return fmt.Errorf("os.MkdirAll: %s: %w", dir, err)
 	}
@@ -250,126 +345,231 @@ func disableDNSStubListener() error {
 		return fmt.Errorf("os.Symlink: %s: %w", resolvConfPath, err)
 	}
 
-	cmd := exec.Command("systemctl", "reload-or-restart", "systemd-resolved")
-	log.Tracef("executing %s %v", cmd.Path, cmd.Args)
-	_, err = cmd.Output()
+	const systemctlCmd = "systemctl"
+
+	systemctlArgs := []string{"reload-or-restart", "systemd-resolved"}
+
+	l.DebugContext(ctx, "executing", "cmd", systemctlCmd, "args", systemctlArgs)
+
+	err = executil.RunWithPeek(
+		ctx,
+		cmdCons,
+		aghos.MaxCmdOutputSize,
+		systemctlCmd,
+		systemctlArgs...,
+	)
 	if err != nil {
-		return err
-	}
-	if cmd.ProcessState.ExitCode() != 0 {
-		return fmt.Errorf("process %s exited with an error: %d",
-			cmd.Path, cmd.ProcessState.ExitCode())
+		return fmt.Errorf("executing cmd: %w", err)
 	}
 
 	return nil
 }
 
 type applyConfigReqEnt struct {
-	IP   net.IP `json:"ip"`
-	Port int    `json:"port"`
+	IP   netip.Addr `json:"ip"`
+	Port uint16     `json:"port"`
 }
 
 type applyConfigReq struct {
-	Web      applyConfigReqEnt `json:"web"`
-	DNS      applyConfigReqEnt `json:"dns"`
-	Username string            `json:"username"`
-	Password string            `json:"password"`
+	Language string `json:"language"`
+	Password string `json:"password"`
+	Username string `json:"username"`
+
+	Web applyConfigReqEnt `json:"web"`
+	DNS applyConfigReqEnt `json:"dns"`
 }
 
 // copyInstallSettings copies the installation parameters between two
-// configuration structures.
+// configuration structures.  All arguments must not be nil.
 func copyInstallSettings(dst, src *configuration) {
-	dst.BindHost = src.BindHost
-	dst.BindPort = src.BindPort
-	dst.BetaBindPort = src.BetaBindPort
 	dst.DNS.BindHosts = src.DNS.BindHosts
 	dst.DNS.Port = src.DNS.Port
+	dst.HTTPConfig = src.HTTPConfig
+	dst.Language = src.Language
 }
 
 // shutdownTimeout is the timeout for shutting HTTP server down operation.
 const shutdownTimeout = 5 * time.Second
 
-func shutdownSrv(ctx context.Context, srv *http.Server) {
-	defer log.OnPanic("")
+// shutdownSrv shuts down srv and logs the error, if any.  l must not be nil.
+func shutdownSrv(ctx context.Context, l *slog.Logger, srv *http.Server) {
+	defer slogutil.RecoverAndLog(ctx, l)
 
 	if srv == nil {
 		return
 	}
 
 	err := srv.Shutdown(ctx)
-	if err != nil {
-		log.Error("error while shutting down http server %q: %s", srv.Addr, err)
+	if err == nil {
+		return
 	}
+
+	lvl := slog.LevelDebug
+	if !errors.Is(err, context.Canceled) {
+		lvl = slog.LevelError
+	}
+
+	l.Log(ctx, lvl, "shutting down http server", "addr", srv.Addr, slogutil.KeyError, err)
 }
 
-// Apply new configuration, start DNS server, restart Web server
-func (web *Web) handleInstallConfigure(w http.ResponseWriter, r *http.Request) {
+// shutdownSrv3 shuts down srv and logs the error, if any.  l must not be nil.
+//
+// TODO(a.garipov): Think of a good way to merge with [shutdownSrv].
+func shutdownSrv3(ctx context.Context, l *slog.Logger, srv *http3.Server) {
+	defer slogutil.RecoverAndLog(ctx, l)
+
+	if srv == nil {
+		return
+	}
+
+	err := srv.Close()
+	if err == nil {
+		return
+	}
+
+	lvl := slog.LevelDebug
+	if !errors.Is(err, context.Canceled) {
+		lvl = slog.LevelError
+	}
+
+	l.Log(ctx, lvl, "shutting down http/3 server", "addr", srv.Addr, slogutil.KeyError, err)
+}
+
+// PasswordMinRunes is the minimum length of user's password in runes.
+const PasswordMinRunes = 8
+
+// handleInstallConfigure handles the installation configuration request.  It
+// validates the request and then finalizes the installation by applying the
+// provided settings.
+func (web *webAPI) handleInstallConfigure(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := web.logger
+
 	req, restartHTTP, err := decodeApplyConfigReq(r.Body)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
-	err = aghnet.CheckPort("udp", req.DNS.IP, req.DNS.Port)
+	if utf8.RuneCountInString(req.Password) < PasswordMinRunes {
+		aghhttp.ErrorAndLog(
+			ctx,
+			l,
+			r,
+			w,
+			http.StatusUnprocessableEntity,
+			"password must be at least %d symbols long",
+			PasswordMinRunes,
+		)
+
+		return
+	}
+
+	err = aghnet.CheckPort("udp", netip.AddrPortFrom(req.DNS.IP, req.DNS.Port))
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
-	err = aghnet.CheckPort("tcp", req.DNS.IP, req.DNS.Port)
+	err = aghnet.CheckPort("tcp", netip.AddrPortFrom(req.DNS.IP, req.DNS.Port))
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "%s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
 
+	web.finalizeInstall(ctx, w, r, req, restartHTTP)
+}
+
+// finalizeInstall completes first-run setup by applying user-provided settings.
+// w, r, and req must not be nil.
+func (web *webAPI) finalizeInstall(
+	ctx context.Context,
+	w http.ResponseWriter,
+	r *http.Request,
+	req *applyConfigReq,
+	restartHTTP bool,
+) {
+	l := web.logger
+
+	var err error
 	curConfig := &configuration{}
 	copyInstallSettings(curConfig, config)
 
-	Context.firstRun = false
-	config.BindHost = req.Web.IP
-	config.BindPort = req.Web.Port
-	config.DNS.BindHosts = []net.IP{req.DNS.IP}
+	defer func() {
+		if err != nil {
+			copyInstallSettings(config, curConfig)
+		}
+	}()
+
+	if req.Language != "" {
+		config.Language = req.Language
+	}
+
+	config.DNS.BindHosts = []netip.Addr{req.DNS.IP}
 	config.DNS.Port = req.DNS.Port
+	config.Filtering.Logger = web.baseLogger.With(slogutil.KeyPrefix, "filtering")
+	config.Filtering.SafeFSPatterns = []string{
+		filepath.Join(web.conf.workDir, userFilterDataDir, "*"),
+	}
+	config.HTTPConfig.Address = netip.AddrPortFrom(req.Web.IP, req.Web.Port)
+
+	u := &webUser{
+		Name: req.Username,
+	}
+	err = web.auth.addUser(ctx, u, req.Password)
+	if err != nil {
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusUnprocessableEntity, "%s", err)
+
+		return
+	}
 
 	// TODO(e.burkov): StartMods() should be put in a separate goroutine at the
 	// moment we'll allow setting up TLS in the initial configuration or the
 	// configuration itself will use HTTPS protocol, because the underlying
 	// functions potentially restart the HTTPS server.
-	err = StartMods()
+	err = web.startMods(ctx)
 	if err != nil {
-		Context.firstRun = true
-		copyInstallSettings(config, curConfig)
-		aghhttp.Error(r, w, http.StatusInternalServerError, "%s", err)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusInternalServerError, "%s", err)
 
 		return
 	}
 
-	u := &User{
-		Name: req.Username,
-	}
-	Context.auth.UserAdd(u, req.Password)
-
-	err = config.write()
+	err = config.write(
+		ctx,
+		web.logger,
+		web.tlsManager.ExtendedTLSConfig(),
+		web.auth,
+		web.conf.workDir,
+		web.conf.confPath,
+	)
 	if err != nil {
-		Context.firstRun = true
-		copyInstallSettings(config, curConfig)
-		aghhttp.Error(r, w, http.StatusInternalServerError, "Couldn't write config: %s", err)
+		aghhttp.ErrorAndLog(
+			ctx,
+			l,
+			r,
+			w,
+			http.StatusInternalServerError,
+			"Couldn't write config: %s",
+			err,
+		)
 
 		return
 	}
 
 	web.conf.firstRun = false
-	web.conf.BindHost = req.Web.IP
-	web.conf.BindPort = req.Web.Port
+	web.conf.BindAddr = netip.AddrPortFrom(req.Web.IP, req.Web.Port)
 
-	registerControlHandlers()
+	web.registerControlHandlers()
 
-	aghhttp.OK(w)
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
+	aghhttp.OK(ctx, l, w)
+
+	rc := http.NewResponseController(w)
+	err = rc.Flush()
+	if err != nil {
+		l.WarnContext(ctx, "flushing response", slogutil.KeyError, err)
 	}
 
 	if !restartHTTP {
@@ -380,13 +580,11 @@ func (web *Web) handleInstallConfigure(w http.ResponseWriter, r *http.Request) {
 	// and with its own context, because it waits until all requests are handled
 	// and will be blocked by it's own caller.
 	go func(timeout time.Duration) {
-		defer log.OnPanic("web")
-
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+		defer slogutil.RecoverAndLog(shutdownCtx, l)
 		defer cancel()
 
-		shutdownSrv(ctx, web.httpServer)
-		shutdownSrv(ctx, web.httpServerBeta)
+		shutdownSrv(shutdownCtx, l, web.httpServer)
 	}(shutdownTimeout)
 }
 
@@ -400,13 +598,20 @@ func decodeApplyConfigReq(r io.Reader) (req *applyConfigReq, restartHTTP bool, e
 		return nil, false, fmt.Errorf("parsing request: %w", err)
 	}
 
+	err = validateLang(req.Language, true)
+	if err != nil {
+		// Don't wrap the error, because it's informative enough as is.
+		return nil, false, err
+	}
+
 	if req.Web.Port == 0 || req.DNS.Port == 0 {
 		return nil, false, errors.Error("ports cannot be 0")
 	}
 
-	restartHTTP = !config.BindHost.Equal(req.Web.IP) || config.BindPort != req.Web.Port
+	addrPort := config.HTTPConfig.Address
+	restartHTTP = addrPort.Addr() != req.Web.IP || addrPort.Port() != req.Web.Port
 	if restartHTTP {
-		err = aghnet.CheckPort("tcp", req.Web.IP, req.Web.Port)
+		err = aghnet.CheckPort("tcp", netip.AddrPortFrom(req.Web.IP, req.Web.Port))
 		if err != nil {
 			return nil, false, fmt.Errorf(
 				"checking address %s:%d: %w",
@@ -420,217 +625,55 @@ func decodeApplyConfigReq(r io.Reader) (req *applyConfigReq, restartHTTP bool, e
 	return req, restartHTTP, err
 }
 
-func (web *Web) registerInstallHandlers() {
-	Context.mux.HandleFunc("/control/install/get_addresses", preInstall(ensureGET(web.handleInstallGetAddresses)))
-	Context.mux.HandleFunc("/control/install/check_config", preInstall(ensurePOST(web.handleInstallCheckConfig)))
-	Context.mux.HandleFunc("/control/install/configure", preInstall(ensurePOST(web.handleInstallConfigure)))
-}
-
-// checkConfigReqEntBeta is a struct representing new client's config check
-// request entry.  It supports multiple IP values unlike the checkConfigReqEnt.
-//
-// TODO(e.burkov): This should removed with the API v1 when the appropriate
-// functionality will appear in default checkConfigReqEnt.
-type checkConfigReqEntBeta struct {
-	Port    int      `json:"port"`
-	IP      []net.IP `json:"ip"`
-	Autofix bool     `json:"autofix"`
-}
-
-// checkConfigReqBeta is a struct representing new client's config check request
-// body.  It uses checkConfigReqEntBeta instead of checkConfigReqEnt.
-//
-// TODO(e.burkov): This should removed with the API v1 when the appropriate
-// functionality will appear in default checkConfigReq.
-type checkConfigReqBeta struct {
-	Web         checkConfigReqEntBeta `json:"web"`
-	DNS         checkConfigReqEntBeta `json:"dns"`
-	SetStaticIP bool                  `json:"set_static_ip"`
-}
-
-// handleInstallCheckConfigBeta is a substitution of /install/check_config
-// handler for new client.
-//
-// TODO(e.burkov): This should removed with the API v1 when the appropriate
-// functionality will appear in default handleInstallCheckConfig.
-func (web *Web) handleInstallCheckConfigBeta(w http.ResponseWriter, r *http.Request) {
-	reqData := checkConfigReqBeta{}
-	err := json.NewDecoder(r.Body).Decode(&reqData)
+// startMods initializes and starts the DNS server after installation.
+func (web *webAPI) startMods(ctx context.Context) (err error) {
+	statsDir, querylogDir, err := checkStatsAndQuerylogDirs(config, web.conf.workDir)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "Failed to parse 'check_config' JSON data: %s", err)
-
-		return
+		// Don't wrap the error, because it's informative enough as is.
+		return err
 	}
 
-	if len(reqData.DNS.IP) == 0 || len(reqData.Web.IP) == 0 {
-		aghhttp.Error(r, w, http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
-
-		return
-	}
-
-	nonBetaReqData := checkConfigReq{
-		Web: checkConfigReqEnt{
-			Port:    reqData.Web.Port,
-			IP:      reqData.Web.IP[0],
-			Autofix: reqData.Web.Autofix,
-		},
-		DNS: checkConfigReqEnt{
-			Port:    reqData.DNS.Port,
-			IP:      reqData.DNS.IP[0],
-			Autofix: reqData.DNS.Autofix,
-		},
-		SetStaticIP: reqData.SetStaticIP,
-	}
-
-	nonBetaReqBody := &strings.Builder{}
-
-	err = json.NewEncoder(nonBetaReqBody).Encode(nonBetaReqData)
+	err = initDNS(
+		ctx,
+		web.baseLogger,
+		web.tlsManager,
+		web.confModifier,
+		web.httpReg,
+		statsDir,
+		querylogDir,
+		web.hostsContainer,
+		web.conf.mux,
+	)
 	if err != nil {
-		aghhttp.Error(
-			r,
-			w,
-			http.StatusBadRequest,
-			"Failed to encode 'check_config' JSON data: %s",
-			err,
-		)
-
-		return
+		// Don't wrap the error, because it's informative enough as is.
+		return err
 	}
-	body := nonBetaReqBody.String()
-	r.Body = io.NopCloser(strings.NewReader(body))
-	r.ContentLength = int64(len(body))
 
-	web.handleInstallCheckConfig(w, r)
-}
-
-// applyConfigReqEntBeta is a struct representing new client's config setting
-// request entry.  It supports multiple IP values unlike the applyConfigReqEnt.
-//
-// TODO(e.burkov): This should removed with the API v1 when the appropriate
-// functionality will appear in default applyConfigReqEnt.
-type applyConfigReqEntBeta struct {
-	IP   []net.IP `json:"ip"`
-	Port int      `json:"port"`
-}
-
-// applyConfigReqBeta is a struct representing new client's config setting
-// request body.  It uses applyConfigReqEntBeta instead of applyConfigReqEnt.
-//
-// TODO(e.burkov): This should removed with the API v1 when the appropriate
-// functionality will appear in default applyConfigReq.
-type applyConfigReqBeta struct {
-	Web      applyConfigReqEntBeta `json:"web"`
-	DNS      applyConfigReqEntBeta `json:"dns"`
-	Username string                `json:"username"`
-	Password string                `json:"password"`
-}
-
-// handleInstallConfigureBeta is a substitution of /install/configure handler
-// for new client.
-//
-// TODO(e.burkov): This should removed with the API v1 when the appropriate
-// functionality will appear in default handleInstallConfigure.
-func (web *Web) handleInstallConfigureBeta(w http.ResponseWriter, r *http.Request) {
-	reqData := applyConfigReqBeta{}
-	err := json.NewDecoder(r.Body).Decode(&reqData)
+	err = startDNSServer(ctx)
 	if err != nil {
-		aghhttp.Error(r, w, http.StatusBadRequest, "Failed to parse 'check_config' JSON data: %s", err)
+		closeDNSServer(ctx, web.baseLogger)
 
-		return
+		// Don't wrap the error, because it's informative enough as is.
+		return err
 	}
 
-	if len(reqData.DNS.IP) == 0 || len(reqData.Web.IP) == 0 {
-		aghhttp.Error(r, w, http.StatusBadRequest, http.StatusText(http.StatusBadRequest))
-
-		return
-	}
-
-	nonBetaReqData := applyConfigReq{
-		Web: applyConfigReqEnt{
-			IP:   reqData.Web.IP[0],
-			Port: reqData.Web.Port,
-		},
-		DNS: applyConfigReqEnt{
-			IP:   reqData.DNS.IP[0],
-			Port: reqData.DNS.Port,
-		},
-		Username: reqData.Username,
-		Password: reqData.Password,
-	}
-
-	nonBetaReqBody := &strings.Builder{}
-
-	err = json.NewEncoder(nonBetaReqBody).Encode(nonBetaReqData)
-	if err != nil {
-		aghhttp.Error(
-			r,
-			w,
-			http.StatusBadRequest,
-			"Failed to encode 'check_config' JSON data: %s",
-			err,
-		)
-
-		return
-	}
-	body := nonBetaReqBody.String()
-	r.Body = io.NopCloser(strings.NewReader(body))
-	r.ContentLength = int64(len(body))
-
-	web.handleInstallConfigure(w, r)
+	return nil
 }
 
-// getAddrsResponseBeta is a struct representing new client's getting addresses
-// request body.  It uses array of structs instead of map.
-//
-// TODO(e.burkov): This should removed with the API v1 when the appropriate
-// functionality will appear in default firstRunData.
-type getAddrsResponseBeta struct {
-	WebPort    int                    `json:"web_port"`
-	DNSPort    int                    `json:"dns_port"`
-	Interfaces []*aghnet.NetInterface `json:"interfaces"`
-}
+// registerInstallHandlers registers install handlers.
+func (web *webAPI) registerInstallHandlers() {
+	mux := web.conf.mux
 
-// handleInstallConfigureBeta is a substitution of /install/get_addresses
-// handler for new client.
-//
-// TODO(e.burkov): This should removed with the API v1 when the appropriate
-// functionality will appear in default handleInstallGetAddresses.
-func (web *Web) handleInstallGetAddressesBeta(w http.ResponseWriter, r *http.Request) {
-	data := getAddrsResponseBeta{}
-	data.WebPort = defaultPortHTTP
-	data.DNSPort = defaultPortDNS
-
-	ifaces, err := aghnet.GetValidNetInterfacesForWeb()
-	if err != nil {
-		aghhttp.Error(r, w, http.StatusInternalServerError, "Couldn't get interfaces: %s", err)
-
-		return
-	}
-
-	data.Interfaces = ifaces
-
-	w.Header().Set("Content-Type", "application/json")
-	err = json.NewEncoder(w).Encode(data)
-	if err != nil {
-		aghhttp.Error(
-			r,
-			w,
-			http.StatusInternalServerError,
-			"Unable to marshal default addresses to json: %s",
-			err,
-		)
-
-		return
-	}
-}
-
-// registerBetaInstallHandlers registers the install handlers for new client
-// with the structures it supports.
-//
-// TODO(e.burkov): This should removed with the API v1 when the appropriate
-// functionality will appear in default handlers.
-func (web *Web) registerBetaInstallHandlers() {
-	Context.mux.HandleFunc("/control/install/get_addresses_beta", preInstall(ensureGET(web.handleInstallGetAddressesBeta)))
-	Context.mux.HandleFunc("/control/install/check_config_beta", preInstall(ensurePOST(web.handleInstallCheckConfigBeta)))
-	Context.mux.HandleFunc("/control/install/configure_beta", preInstall(ensurePOST(web.handleInstallConfigureBeta)))
+	mux.Handle(
+		http.MethodGet+" "+"/control/install/get_addresses",
+		web.preInstallHandler(http.HandlerFunc(web.handleInstallGetAddresses)),
+	)
+	mux.Handle(
+		"/control/install/check_config",
+		web.preInstallHandler(web.ensure(http.MethodPost, web.handleInstallCheckConfig)),
+	)
+	mux.Handle(
+		"/control/install/configure",
+		web.preInstallHandler(web.ensure(http.MethodPost, web.handleInstallConfigure)),
+	)
 }

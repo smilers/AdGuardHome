@@ -1,18 +1,17 @@
 package home
 
 import (
+	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
-	"github.com/AdguardTeam/golibs/log"
-	"github.com/AdguardTeam/golibs/stringutil"
+	"github.com/AdguardTeam/golibs/container"
 )
 
 // TODO(a.garipov): Get rid of a global or generate from .twosky.json.
-var allowedLanguages = stringutil.NewSet(
+var allowedLanguages = container.NewMapSet(
+	"ar",
 	"be",
 	"bg",
 	"cs",
@@ -50,41 +49,64 @@ var allowedLanguages = stringutil.NewSet(
 	"zh-tw",
 )
 
-func handleI18nCurrentLanguage(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/plain")
-	log.Printf("config.Language is %s", config.Language)
-	_, err := fmt.Fprintf(w, "%s\n", config.Language)
-	if err != nil {
-		msg := fmt.Sprintf("Unable to write response json: %s", err)
-		log.Println(msg)
-		http.Error(w, msg, http.StatusInternalServerError)
-		return
+// validateLang returns a standard error about if lang is an unknown language.
+// If allowEmpty is true, the language can also be empty.
+func validateLang(lang string, allowEmpty bool) (err error) {
+	if allowEmpty && lang == "" {
+		return nil
 	}
+
+	if !allowedLanguages.Has(lang) {
+		return fmt.Errorf("unknown language: %q", lang)
+	}
+
+	return nil
 }
 
-func handleI18nChangeLanguage(w http.ResponseWriter, r *http.Request) {
-	// This use of ReadAll is safe, because request's body is now limited.
-	body, err := io.ReadAll(r.Body)
+// languageJSON is the JSON structure for language requests and responses.
+type languageJSON struct {
+	Language string `json:"language"`
+}
+
+// handleI18nCurrentLanguage is the handler for the GET
+// /control/i18n/current_language HTTP API.
+//
+// TODO(d.kolyshev): Deprecated, remove it later.
+func (web *webAPI) handleI18nCurrentLanguage(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := web.logger
+
+	l.InfoContext(ctx, "current language", "lang", config.Language)
+
+	aghhttp.WriteJSONResponseOK(ctx, l, w, r, &languageJSON{
+		Language: config.Language,
+	})
+}
+
+// handleI18nChangeLanguage is the handler for the POST
+// /control/i18n/change_language HTTP API.
+//
+// TODO(d.kolyshev): Deprecated, remove it later.
+func (web *webAPI) handleI18nChangeLanguage(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	l := web.logger
+
+	if aghhttp.WriteTextPlainDeprecated(ctx, l, w, r) {
+		return
+	}
+
+	langReq := &languageJSON{}
+	err := json.NewDecoder(r.Body).Decode(langReq)
 	if err != nil {
-		msg := fmt.Sprintf("failed to read request body: %s", err)
-		log.Println(msg)
-		http.Error(w, msg, http.StatusBadRequest)
-		return
-	}
-
-	language := strings.TrimSpace(string(body))
-	if language == "" {
-		msg := "empty language specified"
-		log.Println(msg)
-		http.Error(w, msg, http.StatusBadRequest)
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusInternalServerError, "reading req: %s", err)
 
 		return
 	}
 
-	if !allowedLanguages.Has(language) {
-		msg := fmt.Sprintf("unknown language specified: %s", language)
-		log.Println(msg)
-		http.Error(w, msg, http.StatusBadRequest)
+	lang := langReq.Language
+	err = validateLang(lang, false)
+	if err != nil {
+		aghhttp.ErrorAndLog(ctx, l, r, w, http.StatusBadRequest, "%s", err)
 
 		return
 	}
@@ -93,9 +115,11 @@ func handleI18nChangeLanguage(w http.ResponseWriter, r *http.Request) {
 		config.Lock()
 		defer config.Unlock()
 
-		config.Language = language
+		config.Language = lang
+		l.InfoContext(ctx, "language is updated", "lang", lang)
 	}()
 
-	onConfigModified()
-	aghhttp.OK(w)
+	web.confModifier.Apply(ctx)
+
+	aghhttp.OK(ctx, l, w)
 }

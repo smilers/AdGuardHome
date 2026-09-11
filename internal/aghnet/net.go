@@ -1,85 +1,122 @@
-// Package aghnet contains some utilities for networking.
+// Package aghnet contains networking utilities.
 package aghnet
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
-	"os/exec"
+	"net/netip"
+	"net/url"
+	"slices"
 	"strings"
 	"syscall"
 
+	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/log"
-	"github.com/AdguardTeam/golibs/netutil"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/osutil"
+	"github.com/AdguardTeam/golibs/osutil/executil"
+)
+
+// DialContextFunc is the semantic alias for dialing functions, such as
+// [http.Transport.DialContext].
+type DialContextFunc = func(ctx context.Context, network, addr string) (conn net.Conn, err error)
+
+// Variables and functions to substitute in tests.
+var (
+	// netInterfaceAddrs is the function to get the available network
+	// interfaces.
+	netInterfaceAddrs = net.InterfaceAddrs
+
+	// rootDirFS is the filesystem pointing to the root directory.
+	rootDirFS = osutil.RootDirFS()
 )
 
 // ErrNoStaticIPInfo is returned by IfaceHasStaticIP when no information about
-// the IP being static is available.
+// whether the IP is static is available.
 const ErrNoStaticIPInfo errors.Error = "no information about static ip"
 
-// IfaceHasStaticIP checks if interface is configured to have static IP address.
-// If it can't give a definitive answer, it returns false and an error for which
-// errors.Is(err, ErrNoStaticIPInfo) is true.
-func IfaceHasStaticIP(ifaceName string) (has bool, err error) {
-	return ifaceHasStaticIP(ifaceName)
+// IfaceHasStaticIP reports whether the interface has a static IP.  If the
+// status is indeterminate, it returns false with an error matching
+// [ErrNoStaticIPInfo].  cmdCons must not be nil.
+func IfaceHasStaticIP(
+	ctx context.Context,
+	cmdCons executil.CommandConstructor,
+	ifaceName string,
+) (has bool, err error) {
+	return ifaceHasStaticIP(ctx, cmdCons, ifaceName)
 }
 
-// IfaceSetStaticIP sets static IP address for network interface.
-func IfaceSetStaticIP(ifaceName string) (err error) {
-	return ifaceSetStaticIP(ifaceName)
+// IfaceSetStaticIP sets a static IP address for network interface.  l and
+// cmdCons must not be nil.
+func IfaceSetStaticIP(
+	ctx context.Context,
+	l *slog.Logger,
+	cmdCons executil.CommandConstructor,
+	ifaceName string,
+) (err error) {
+	return ifaceSetStaticIP(ctx, l, cmdCons, ifaceName)
 }
 
-// GatewayIP returns IP address of interface's gateway.
-func GatewayIP(ifaceName string) net.IP {
-	cmd := exec.Command("ip", "route", "show", "dev", ifaceName)
-	log.Tracef("executing %s %v", cmd.Path, cmd.Args)
-	d, err := cmd.Output()
-	if err != nil || cmd.ProcessState.ExitCode() != 0 {
-		return nil
-	}
-
-	fields := strings.Fields(string(d))
-	// The meaningful "ip route" command output should contain the word
-	// "default" at first field and default gateway IP address at third
-	// field.
-	if len(fields) < 3 || fields[0] != "default" {
-		return nil
-	}
-
-	return net.ParseIP(fields[2])
-}
-
-// CanBindPort checks if we can bind to the given port.
-func CanBindPort(port int) (can bool, err error) {
-	var addr *net.TCPAddr
-	addr, err = net.ResolveTCPAddr("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+// GatewayIP returns the gateway IP address for the interface.  l and cmdCons
+// must not be nil.
+//
+// TODO(e.burkov):  Investigate if the gateway address may be fetched in another
+// way since not every machine has the software installed.
+func GatewayIP(
+	ctx context.Context,
+	l *slog.Logger,
+	cmdCons executil.CommandConstructor,
+	ifaceName string,
+) (ip netip.Addr) {
+	stdout := bytes.Buffer{}
+	err := executil.Run(
+		ctx,
+		cmdCons,
+		&executil.CommandConfig{
+			Path:   "ip",
+			Args:   []string{"route", "show", "dev", ifaceName},
+			Stdout: &stdout,
+		},
+	)
 	if err != nil {
-		return false, err
+		if code, ok := executil.ExitCodeFromError(err); ok {
+			err = fmt.Errorf("unexpected exit code %d: %w", code, err)
+		}
+
+		l.DebugContext(ctx, "fetching gateway ip", slogutil.KeyError, err)
+
+		return netip.Addr{}
 	}
 
-	var listener *net.TCPListener
-	listener, err = net.ListenTCP("tcp", addr)
-	if err != nil {
-		return false, err
+	fields := bytes.Fields(stdout.Bytes())
+	if len(fields) < 3 || !bytes.Equal(fields[0], []byte("default")) {
+		return netip.Addr{}
 	}
-	_ = listener.Close()
-	return true, nil
+
+	if err = ip.UnmarshalText(fields[2]); err != nil {
+		return netip.Addr{}
+	}
+
+	return ip
 }
 
 // CanBindPrivilegedPorts checks if current process can bind to privileged
-// ports.
-func CanBindPrivilegedPorts() (can bool, err error) {
-	return canBindPrivilegedPorts()
+// ports.  l must not be nil.
+func CanBindPrivilegedPorts(ctx context.Context, l *slog.Logger) (can bool, err error) {
+	return canBindPrivilegedPorts(ctx, l)
 }
 
 // NetInterface represents an entry of network interfaces map.
 type NetInterface struct {
 	// Addresses are the network interface addresses.
-	Addresses []net.IP `json:"ip_addresses,omitempty"`
+	Addresses []netip.Addr `json:"ip_addresses,omitempty"`
 	// Subnets are the IP networks for this network interface.
-	Subnets      []*net.IPNet     `json:"-"`
+	Subnets      []netip.Prefix   `json:"-"`
 	Name         string           `json:"name"`
 	HardwareAddr net.HardwareAddr `json:"hardware_address"`
 	Flags        net.Flags        `json:"flags"`
@@ -100,82 +137,143 @@ func (iface NetInterface) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// GetValidNetInterfacesForWeb returns interfaces that are eligible for DNS and WEB only
-// we do not return link-local addresses here
-func GetValidNetInterfacesForWeb() ([]*NetInterface, error) {
-	ifaces, err := net.Interfaces()
+// NetInterfaceFrom converts a [net.Interface] to [NetInterface], populating
+// name, MAC address, flags, MTU, IP addresses, and subnets.  iface must not be
+// nil.
+func NetInterfaceFrom(iface *net.Interface) (niface *NetInterface, err error) {
+	niface = &NetInterface{
+		Name:         iface.Name,
+		HardwareAddr: iface.HardwareAddr,
+		Flags:        iface.Flags,
+		MTU:          iface.MTU,
+	}
+
+	addrs, err := iface.Addrs()
 	if err != nil {
-		return nil, fmt.Errorf("couldn't get interfaces: %w", err)
-	}
-	if len(ifaces) == 0 {
-		return nil, errors.Error("couldn't find any legible interface")
+		return nil, fmt.Errorf("getting addresses for interface %q: %w", iface.Name, err)
 	}
 
-	var netInterfaces []*NetInterface
-
-	for _, iface := range ifaces {
-		var addrs []net.Addr
-		addrs, err = iface.Addrs()
-		if err != nil {
-			return nil, fmt.Errorf("failed to get addresses for interface %s: %w", iface.Name, err)
-		}
-
-		netIface := &NetInterface{
-			MTU:          iface.MTU,
-			Name:         iface.Name,
-			HardwareAddr: iface.HardwareAddr,
-			Flags:        iface.Flags,
-		}
-
-		// Collect network interface addresses.
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok {
-				// Should be net.IPNet, this is weird.
-				return nil, fmt.Errorf("got iface.Addrs() element %s that is not net.IPNet, it is %T", addr, addr)
-			}
-			// Ignore link-local.
-			if ipNet.IP.IsLinkLocalUnicast() {
-				continue
-			}
-			netIface.Addresses = append(netIface.Addresses, ipNet.IP)
-			netIface.Subnets = append(netIface.Subnets, ipNet)
-		}
-
-		// Discard interfaces with no addresses.
-		if len(netIface.Addresses) != 0 {
-			netInterfaces = append(netInterfaces, netIface)
+	for i, addr := range addrs {
+		if err = populateAddrs(addr, niface); err != nil {
+			return nil, fmt.Errorf("populating at index %d: %w", i, err)
 		}
 	}
 
-	return netInterfaces, nil
+	return niface, nil
 }
 
-// GetInterfaceByIP returns the name of interface containing provided ip.
-func GetInterfaceByIP(ip net.IP) string {
+// populateAddrs fills *NetInterface IP addresses and subnets.  addr and niface
+// must not be nil.
+func populateAddrs(addr net.Addr, niface *NetInterface) (err error) {
+	n, err := ipNetFromAddr(addr)
+	if err != nil {
+		return err
+	}
+
+	ip, ok := netip.AddrFromSlice(n.IP)
+	if !ok {
+		return fmt.Errorf("bad address %s", n.IP)
+	}
+
+	ip = ip.Unmap()
+
+	// Skip link-local IPv4 addresses
+	if isLinkLocalV4(ip) {
+		return nil
+	}
+
+	if ip.IsLinkLocalUnicast() {
+		ip = ip.WithZone(niface.Name)
+	}
+
+	ones, _ := n.Mask.Size()
+	p := netip.PrefixFrom(ip, ones)
+
+	niface.Addresses = append(niface.Addresses, ip)
+	niface.Subnets = append(niface.Subnets, p)
+
+	return nil
+}
+
+// ipNetFromAddr converts net.Addr to *net.IPNet and its IP to v4 if necessary.
+func ipNetFromAddr(addr net.Addr) (ip *net.IPNet, err error) {
+	ipNet, ok := addr.(*net.IPNet)
+	if !ok {
+		// Should be *net.IPNet, this is weird.
+		return nil, fmt.Errorf("bad type for interface net.Addr %T(%[1]v)", ipNet)
+	}
+
+	// TODO(f.setrakov): Explore whether this logic can be safely removed.
+	if ip4 := ipNet.IP.To4(); ip4 != nil {
+		ipNet.IP = ip4
+	}
+
+	return ipNet, nil
+}
+
+// isLinkLocalV4 checks if ip is link-local unicast IPv4 address.
+func isLinkLocalV4(ip netip.Addr) (ok bool) {
+	return ip.Is4() && ip.IsLinkLocalUnicast()
+}
+
+// GetValidNetInterfacesForWeb returns interfaces that are eligible for DNS and
+// WEB only we do not return link-local addresses here.
+//
+// TODO(e.burkov):  Can't properly test the function since it's nontrivial to
+// substitute net.Interface.Addrs and the net.InterfaceAddrs can't be used.
+func GetValidNetInterfacesForWeb() (nifaces []*NetInterface, err error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("getting interfaces: %w", err)
+	} else if len(ifaces) == 0 {
+		return nil, errors.Error("no legible interfaces")
+	}
+
+	for i := range ifaces {
+		var niface *NetInterface
+		niface, err = NetInterfaceFrom(&ifaces[i])
+		if err != nil {
+			return nil, err
+		} else if len(niface.Addresses) != 0 {
+			// Discard interfaces with no addresses.
+			nifaces = append(nifaces, niface)
+		}
+	}
+
+	return nifaces, nil
+}
+
+// InterfaceByIP returns the name of the interface bound to ip.
+//
+// TODO(a.garipov, e.burkov): This function is technically incorrect, since one
+// IP address can be shared by multiple interfaces in some configurations.
+//
+// TODO(e.burkov):  See TODO on GetValidNetInterfacesForWeb.
+func InterfaceByIP(ip netip.Addr) (ifaceName string) {
 	ifaces, err := GetValidNetInterfacesForWeb()
 	if err != nil {
 		return ""
 	}
 
 	for _, iface := range ifaces {
-		for _, addr := range iface.Addresses {
-			if ip.Equal(addr) {
-				return iface.Name
-			}
+		if slices.Contains(iface.Addresses, ip) {
+			return iface.Name
 		}
 	}
 
 	return ""
 }
 
-// GetSubnet returns pointer to net.IPNet for the specified interface or nil if
-// the search fails.
-func GetSubnet(ifaceName string) *net.IPNet {
+// GetSubnet returns the subnet corresponding to the interface of zero prefix if
+// the search fails.  l must not be nil.
+//
+// TODO(e.burkov):  See TODO on GetValidNetInterfacesForWeb.
+func GetSubnet(ctx context.Context, l *slog.Logger, ifaceName string) (p netip.Prefix) {
 	netIfaces, err := GetValidNetInterfacesForWeb()
 	if err != nil {
-		log.Error("Could not get network interfaces info: %v", err)
-		return nil
+		l.ErrorContext(ctx, "could not get network interfaces info", slogutil.KeyError, err)
+
+		return p
 	}
 
 	for _, netIface := range netIfaces {
@@ -184,13 +282,14 @@ func GetSubnet(ifaceName string) *net.IPNet {
 		}
 	}
 
-	return nil
+	return p
 }
 
-// CheckPort checks if the port is available for binding.
-func CheckPort(network string, ip net.IP, port int) (err error) {
+// CheckPort checks if the port is available for binding.  network is expected
+// to be one of "udp" and "tcp".
+func CheckPort(network string, ipp netip.AddrPort) (err error) {
 	var c io.Closer
-	addr := netutil.IPPort{IP: ip, Port: port}.String()
+	addr := ipp.String()
 	switch network {
 	case "tcp":
 		c, err = net.Listen(network, addr)
@@ -200,84 +299,129 @@ func CheckPort(network string, ip net.IP, port int) (err error) {
 		return nil
 	}
 
-	return errors.WithDeferred(err, closePortChecker(c))
+	if err != nil {
+		return err
+	}
+
+	return closePortChecker(c)
 }
 
 // IsAddrInUse checks if err is about unsuccessful address binding.
 func IsAddrInUse(err error) (ok bool) {
-	var sysErr syscall.Errno
-	if !errors.As(err, &sysErr) {
+	sysErr, ok := errors.AsType[syscall.Errno](err)
+	if !ok {
 		return false
 	}
 
 	return isAddrInUse(sysErr)
 }
 
-// SplitHost is a wrapper for net.SplitHostPort for the cases when the hostport
-// does not necessarily contain a port.
-func SplitHost(hostport string) (host string, err error) {
-	host, _, err = net.SplitHostPort(hostport)
-	if err != nil {
-		// Check for the missing port error.  If it is that error, just
-		// use the host as is.
-		//
-		// See the source code for net.SplitHostPort.
-		const missingPort = "missing port in address"
-
-		addrErr := &net.AddrError{}
-		if !errors.As(err, &addrErr) || addrErr.Err != missingPort {
-			return "", err
-		}
-
-		host = hostport
-	}
-
-	return host, nil
-}
-
 // CollectAllIfacesAddrs returns the slice of all network interfaces IP
 // addresses without port number.
-func CollectAllIfacesAddrs() (addrs []string, err error) {
-	var ifaces []net.Interface
-	ifaces, err = net.Interfaces()
+func CollectAllIfacesAddrs() (addrs []netip.Addr, err error) {
+	var ifaceAddrs []net.Addr
+	ifaceAddrs, err = netInterfaceAddrs()
 	if err != nil {
-		return nil, fmt.Errorf("getting network interfaces: %w", err)
+		return nil, fmt.Errorf("getting interfaces addresses: %w", err)
 	}
 
-	for _, iface := range ifaces {
-		var ifaceAddrs []net.Addr
-		ifaceAddrs, err = iface.Addrs()
+	for _, addr := range ifaceAddrs {
+		var p netip.Prefix
+		p, err = netip.ParsePrefix(addr.String())
 		if err != nil {
-			return nil, fmt.Errorf("getting addresses for %q: %w", iface.Name, err)
+			// Don't wrap the error since it's informative enough as is.
+			return nil, err
 		}
 
-		for _, addr := range ifaceAddrs {
-			cidr := addr.String()
-			var ip net.IP
-			ip, _, err = net.ParseCIDR(cidr)
-			if err != nil {
-				return nil, fmt.Errorf("parsing cidr: %w", err)
-			}
-
-			addrs = append(addrs, ip.String())
-		}
+		addrs = append(addrs, p.Addr())
 	}
 
 	return addrs, nil
 }
 
-// BroadcastFromIPNet calculates the broadcast IP address for n.
-func BroadcastFromIPNet(n *net.IPNet) (dc net.IP) {
-	dc = netutil.CloneIP(n.IP)
-
-	mask := n.Mask
-	if mask == nil {
-		mask = dc.DefaultMask()
+// ParseAddrPort parses an [netip.AddrPort] from s, which should be either a
+// valid IP, optionally with port, or a valid URL with plain IP address.  The
+// defaultPort is used if s doesn't contain port number.
+func ParseAddrPort(s string, defaultPort uint16) (ipp netip.AddrPort, err error) {
+	u, err := url.Parse(s)
+	if err == nil && u.Host != "" {
+		s = u.Host
 	}
 
-	for i, b := range mask {
-		dc[i] |= ^b
+	ipp, err = netip.ParseAddrPort(s)
+	if err != nil {
+		ip, parseErr := netip.ParseAddr(s)
+		if parseErr != nil {
+			return ipp, errors.Join(err, parseErr)
+		}
+
+		return netip.AddrPortFrom(ip, defaultPort), nil
 	}
 
-	return dc
+	return ipp, nil
+}
+
+// ParseSubnet parses s either as a CIDR prefix itself, or as an IP address,
+// returning the corresponding single-IP CIDR prefix.
+//
+// TODO(e.burkov):  Taken from dnsproxy, move to golibs.
+func ParseSubnet(s string) (p netip.Prefix, err error) {
+	if strings.Contains(s, "/") {
+		p, err = netip.ParsePrefix(s)
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+	} else {
+		var ip netip.Addr
+		ip, err = netip.ParseAddr(s)
+		if err != nil {
+			return netip.Prefix{}, err
+		}
+
+		p = netip.PrefixFrom(ip, ip.BitLen())
+	}
+
+	return p, nil
+}
+
+// ParseBootstraps returns the slice of upstream resolvers parsed from addrs.
+// It additionally returns the closers for each resolver, that should be closed
+// after use.
+func ParseBootstraps(
+	addrs []string,
+	opts *upstream.Options,
+) (boots []*upstream.UpstreamResolver, err error) {
+	boots = make([]*upstream.UpstreamResolver, 0, len(boots))
+	for i, b := range addrs {
+		var r *upstream.UpstreamResolver
+		r, err = upstream.NewUpstreamResolver(b, opts)
+		if err != nil {
+			return nil, fmt.Errorf("bootstrap at index %d: %w", i, err)
+		}
+
+		boots = append(boots, r)
+	}
+
+	return boots, nil
+}
+
+// BroadcastFromPref calculates the broadcast IP address for p.
+func BroadcastFromPref(p netip.Prefix) (bc netip.Addr) {
+	bc = p.Addr().Unmap()
+	if !bc.IsValid() {
+		return netip.Addr{}
+	}
+
+	maskLen, addrLen := p.Bits(), bc.BitLen()
+	if maskLen == addrLen {
+		return bc
+	}
+
+	ipBytes := bc.AsSlice()
+	for i := maskLen; i < addrLen; i++ {
+		ipBytes[i/8] |= 1 << (7 - (i % 8))
+	}
+	bc, _ = netip.AddrFromSlice(ipBytes)
+
+	return bc
 }

@@ -1,39 +1,19 @@
 package dnsforward
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
-	"path"
+	"log/slog"
+	"net/http"
 	"strings"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/client"
 	"github.com/AdguardTeam/dnsproxy/proxy"
-	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/netutil"
-	"github.com/lucas-clemente/quic-go"
 )
 
-// ValidateClientID returns an error if clientID is not a valid client ID.
-func ValidateClientID(clientID string) (err error) {
-	err = netutil.ValidateDomainNameLabel(clientID)
-	if err != nil {
-		// Replace the domain name label wrapper with our own.
-		return fmt.Errorf("invalid client id %q: %w", clientID, errors.Unwrap(err))
-	}
-
-	return nil
-}
-
-// hasLabelSuffix returns true if s ends with suffix preceded by a dot.  It's
-// a helper function to prevent unnecessary allocations in code like:
-//
-// if strings.HasSuffix(s, "." + suffix) { /* … */ }
-//
-// s must be longer than suffix.
-func hasLabelSuffix(s, suffix string) (ok bool) {
-	return strings.HasSuffix(s, suffix) && s[len(s)-len(suffix)-1] == '.'
-}
-
-// clientIDFromClientServerName extracts and validates a client ID.  hostSrvName
+// clientIDFromClientServerName extracts and validates a ClientID.  hostSrvName
 // is the server name of the host.  cliSrvName is the server name as sent by the
 // client.  When strict is true, and client and host server name don't match,
 // clientIDFromClientServerName will return an error.
@@ -46,7 +26,7 @@ func clientIDFromClientServerName(
 		return "", nil
 	}
 
-	if !hasLabelSuffix(cliSrvName, hostSrvName) {
+	if !netutil.IsImmediateSubdomain(cliSrvName, hostSrvName) {
 		if !strict {
 			return "", nil
 		}
@@ -59,52 +39,45 @@ func clientIDFromClientServerName(
 	}
 
 	clientID = cliSrvName[:len(cliSrvName)-len(hostSrvName)-1]
-	err = ValidateClientID(clientID)
+	err = client.ValidateClientID(clientID)
 	if err != nil {
 		// Don't wrap the error, because it's informative enough as is.
 		return "", err
 	}
 
-	return clientID, nil
+	return strings.ToLower(clientID), nil
 }
 
-// clientIDFromDNSContextHTTPS extracts the client's ID from the path of the
-// client's DNS-over-HTTPS request.
+const (
+	// clientIDParamName is the name of the parameter used in the pattern of the
+	// client's DNS-over-HTTPS request.
+	clientIDParamName = "ClientID"
+
+	// clientIDParamTemplate is the template for the client ID parameter in the
+	// client's DNS-over-HTTPS request.
+	clientIDParamTemplate = "{" + clientIDParamName + "}"
+)
+
+// clientIDFromDNSContextHTTPS extracts the ClientID from the pattern of the
+// client's DNS-over-HTTPS request.  pctx must not be nil.
 func clientIDFromDNSContextHTTPS(pctx *proxy.DNSContext) (clientID string, err error) {
 	r := pctx.HTTPRequest
 	if r == nil {
-		return "", fmt.Errorf(
-			"proxy ctx http request of proto %s is nil",
-			pctx.Proto,
-		)
+		return "", fmt.Errorf("proxy ctx http request of proto %s is nil", pctx.Proto)
 	}
 
-	origPath := r.URL.Path
-	parts := strings.Split(path.Clean(origPath), "/")
-	if parts[0] == "" {
-		parts = parts[1:]
-	}
-
-	if len(parts) == 0 || parts[0] != "dns-query" {
-		return "", fmt.Errorf("client id check: invalid path %q", origPath)
-	}
-
-	switch len(parts) {
-	case 1:
-		// Just /dns-query, no client ID.
+	if !strings.Contains(r.Pattern, clientIDParamTemplate) {
+		// ClientID is not in the pattern.
 		return "", nil
-	case 2:
-		clientID = parts[1]
-	default:
-		return "", fmt.Errorf("client id check: invalid path %q: extra parts", origPath)
 	}
 
-	err = ValidateClientID(clientID)
+	clientID = r.PathValue(clientIDParamName)
+	err = client.ValidateClientID(clientID)
 	if err != nil {
-		return "", fmt.Errorf("client id check: %w", err)
+		return "", fmt.Errorf("clientid check: %w", err)
 	}
 
-	return clientID, nil
+	return strings.ToLower(clientID), nil
 }
 
 // tlsConn is a narrow interface for *tls.Conn to simplify testing.
@@ -112,62 +85,61 @@ type tlsConn interface {
 	ConnectionState() (cs tls.ConnectionState)
 }
 
-// quicSession is a narrow interface for quic.Session to simplify testing.
-type quicSession interface {
-	ConnectionState() (cs quic.ConnectionState)
-}
+// clientServerName returns the TLS server name based on the protocol.  For
+// DNS-over-HTTPS requests, it will return the hostname part of the Host header
+// if there is one.  l and pctx must not be nil.
+func clientServerName(
+	ctx context.Context,
+	l *slog.Logger,
+	pctx *proxy.DNSContext,
+	proto proxy.Proto,
+) (srvName string, err error) {
+	from := "tls conn"
 
-// clientIDFromDNSContext extracts the client's ID from the server name of the
-// client's DoT or DoQ request or the path of the client's DoH.  If the protocol
-// is not one of these, clientID is an empty string and err is nil.
-func (s *Server) clientIDFromDNSContext(pctx *proxy.DNSContext) (clientID string, err error) {
-	proto := pctx.Proto
-	if proto == proxy.ProtoHTTPS {
-		return clientIDFromDNSContextHTTPS(pctx)
-	} else if proto != proxy.ProtoTLS && proto != proxy.ProtoQUIC {
-		return "", nil
-	}
-
-	hostSrvName := s.conf.ServerName
-	if hostSrvName == "" {
-		return "", nil
-	}
-
-	cliSrvName := ""
 	switch proto {
+	case proxy.ProtoHTTPS:
+		var fromHost bool
+		srvName, fromHost, err = clientServerNameFromHTTP(pctx.HTTPRequest)
+		if err != nil {
+			return "", fmt.Errorf("from http: %w", err)
+		}
+
+		if fromHost {
+			from = "host header"
+		}
+	case proxy.ProtoQUIC:
+		srvName = pctx.QUICConnection.ConnectionState().TLS.ServerName
 	case proxy.ProtoTLS:
 		conn := pctx.Conn
 		tc, ok := conn.(tlsConn)
 		if !ok {
-			return "", fmt.Errorf(
-				"proxy ctx conn of proto %s is %T, want *tls.Conn",
-				proto,
-				conn,
-			)
+			return "", fmt.Errorf("pctx conn of proto %s is %T, want *tls.Conn", proto, conn)
 		}
 
-		cliSrvName = tc.ConnectionState().ServerName
-	case proxy.ProtoQUIC:
-		qs, ok := pctx.QUICSession.(quicSession)
-		if !ok {
-			return "", fmt.Errorf(
-				"proxy ctx quic session of proto %s is %T, want quic.Session",
-				proto,
-				pctx.QUICSession,
-			)
-		}
-
-		cliSrvName = qs.ConnectionState().TLS.ServerName
+		srvName = tc.ConnectionState().ServerName
 	}
 
-	clientID, err = clientIDFromClientServerName(
-		hostSrvName,
-		cliSrvName,
-		s.conf.StrictSNICheck,
-	)
+	l.DebugContext(ctx, "got client server name", "name", srvName, "from", from)
+
+	return srvName, nil
+}
+
+// clientServerNameFromHTTP returns the TLS server name or the value of the host
+// header depending on the protocol.  fromHost is true if srvName comes from the
+// "Host" HTTP header.
+func clientServerNameFromHTTP(r *http.Request) (srvName string, fromHost bool, err error) {
+	if connState := r.TLS; connState != nil {
+		return connState.ServerName, false, nil
+	}
+
+	if r.Host == "" {
+		return "", false, nil
+	}
+
+	srvName, err = netutil.SplitHost(r.Host)
 	if err != nil {
-		return "", fmt.Errorf("client id check: %w", err)
+		return "", false, fmt.Errorf("parsing host: %w", err)
 	}
 
-	return clientID, nil
+	return srvName, true, nil
 }

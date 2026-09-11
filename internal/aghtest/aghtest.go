@@ -2,45 +2,93 @@
 package aghtest
 
 import (
-	"io"
-	"os"
+	"crypto/sha256"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"net/url"
 	"testing"
+	"time"
 
-	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/dnsproxy/proxy"
+	"github.com/AdguardTeam/golibs/netutil"
+	"github.com/AdguardTeam/golibs/testutil"
+	"github.com/miekg/dns"
+	"github.com/stretchr/testify/require"
 )
 
-// DiscardLogOutput runs tests with discarded logger output.
-func DiscardLogOutput(m *testing.M) {
-	// TODO(e.burkov): Refactor code and tests to not use the global mutable
-	// logger.
-	log.SetOutput(io.Discard)
+const (
+	// ReqHost is the common request host for filtering tests.
+	ReqHost = "www.host.example"
 
-	os.Exit(m.Run())
+	// ReqFQDN is the common request FQDN for filtering tests.
+	ReqFQDN = ReqHost + "."
+)
+
+// HostToIPs is a helper that generates one IPv4 and one IPv6 address from host.
+func HostToIPs(host string) (ipv4, ipv6 netip.Addr) {
+	hash := sha256.Sum256([]byte(host))
+
+	return netip.AddrFrom4([4]byte(hash[:4])), netip.AddrFrom16([16]byte(hash[4:20]))
 }
 
-// ReplaceLogWriter moves logger output to w and uses Cleanup method of t to
-// revert changes.
-func ReplaceLogWriter(t *testing.T, w io.Writer) {
-	stdWriter := log.Writer()
-	t.Cleanup(func() {
-		log.SetOutput(stdWriter)
-	})
-	log.SetOutput(w)
+// StartHTTPServer is a helper that starts the HTTP server, which is configured
+// to handle HTTP requests with the given handler.  It then returns the client
+// and server URL.
+func StartHTTPServer(tb testing.TB, handler http.Handler) (c *http.Client, u *url.URL) {
+	tb.Helper()
+
+	srv := httptest.NewServer(handler)
+	tb.Cleanup(srv.Close)
+
+	u, err := url.Parse(srv.URL)
+	require.NoError(tb, err)
+
+	return srv.Client(), u
 }
 
-// ReplaceLogLevel sets logging level to l and uses Cleanup method of t to
-// revert changes.
-func ReplaceLogLevel(t *testing.T, l log.Level) {
-	switch l {
-	case log.INFO, log.DEBUG, log.ERROR:
-		// Go on.
-	default:
-		t.Fatalf("wrong l value (must be one of %v, %v, %v)", log.INFO, log.DEBUG, log.ERROR)
+// testTimeout is a timeout for tests.
+//
+// TODO(e.burkov):  Move into agdctest.
+const testTimeout = 1 * time.Second
+
+// StartLocalhostUpstream is a test helper that starts a DNS server on
+// localhost.
+func StartLocalhostUpstream(tb testing.TB, h dns.Handler) (addr *url.URL) {
+	tb.Helper()
+
+	startCh := make(chan netip.AddrPort)
+	defer close(startCh)
+	errCh := make(chan error)
+
+	srv := &dns.Server{
+		Addr:         "127.0.0.1:0",
+		Net:          string(proxy.ProtoTCP),
+		Handler:      h,
+		ReadTimeout:  testTimeout,
+		WriteTimeout: testTimeout,
+	}
+	srv.NotifyStartedFunc = func() {
+		addrPort := srv.Listener.Addr()
+		startCh <- netutil.NetAddrToAddrPort(addrPort)
 	}
 
-	stdLevel := log.GetLevel()
-	t.Cleanup(func() {
-		log.SetLevel(stdLevel)
-	})
-	log.SetLevel(l)
+	go func() { errCh <- srv.ListenAndServe() }()
+
+	select {
+	case addrPort := <-startCh:
+		addr = &url.URL{
+			Scheme: string(proxy.ProtoTCP),
+			Host:   addrPort.String(),
+		}
+
+		testutil.CleanupAndRequireSuccess(tb, func() (err error) { return <-errCh })
+		testutil.CleanupAndRequireSuccess(tb, srv.Shutdown)
+	case err := <-errCh:
+		require.NoError(tb, err)
+	case <-time.After(testTimeout):
+		require.FailNow(tb, "timeout exceeded")
+	}
+
+	return addr
 }
